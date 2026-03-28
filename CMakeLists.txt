@@ -12,12 +12,12 @@ option(FLAMEGPU_VISUALISATION "Enable FLAMEGPU visualisation support" OFF)
 # Our core dependency is FLAMEGPU2 lib, first lets find it
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flamegpu2.cmake)
 
-# Handle CMAKE_CUDA_ARCHITECTURES gracefully, passign the project name for code-injection
+# Handle CMAKE_CUDA_ARCHITECTURES gracefully, passing the project name for code-injection
 include(${FLAMEGPU_ROOT}/cmake/CUDAArchitectures.cmake)
-flamegpu_init_cuda_architectures(PROJECT template)
+flamegpu_init_cuda_architectures(PROJECT wisconsin_pr_simulation)
 
 # Name the project and set languages, this must be done after flamegpu_init_cuda_architectures
-project(template CUDA CXX)
+project(wisconsin_pr_simulation CUDA CXX)
 
 # Include common rules from the FLAMEGPU/FLAMEGPU2 repositories CMake
 include(${FLAMEGPU_ROOT}/cmake/common.cmake)
@@ -40,4 +40,4 @@ target_include_directories("${PROJECT_NAME}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR
 set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY VS_STARTUP_PROJECT "${PROJECT_NAME}")
 
 # Set the default (visual studio) debugger configuration
-set_target_properties("${PROJECT_NAME}" PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VS_DEBUGGER_COMMAND_ARGUMENTS "-s 10")
+set_target_properties("${PROJECT_NAME}" PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VS_DEBUGGER_COMMAND_ARGUMENTS "-s 1")
