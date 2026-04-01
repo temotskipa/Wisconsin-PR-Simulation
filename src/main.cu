@@ -80,6 +80,7 @@ struct PartyState {
     float momentum = 0.0f;
     float fundraising = 0.0f;
     float media_reach = 0.0f;
+    bool active = false;
 };
 
 struct PartyResult {
@@ -361,13 +362,13 @@ float ComputeRegionalBreadth(
 }
 
 template <typename PartyRange>
-std::unordered_map<unsigned int, PartyState> SnapshotParties(const PartyRange& parties) {
-    std::unordered_map<unsigned int, PartyState> party_states;
-    party_states.reserve(PARTY_COUNT);
+std::array<PartyState, PARTY_COUNT> SnapshotParties(const PartyRange& parties) {
+    std::array<PartyState, PARTY_COUNT> party_states{};
 
     for (const auto& party : parties) {
         const unsigned int party_id = party.template getVariable<unsigned int>("party_id");
-        party_states.emplace(party_id, PartyState{
+        if (party_id >= PARTY_COUNT) continue;
+        party_states[party_id] = PartyState{
             party_id,
             party.template getVariable<float>("ideology"),
             party.template getVariable<float>("organization"),
@@ -378,7 +379,8 @@ std::unordered_map<unsigned int, PartyState> SnapshotParties(const PartyRange& p
             party.template getVariable<float>("momentum"),
             party.template getVariable<float>("fundraising"),
             party.template getVariable<float>("media_reach"),
-        });
+            true,  // active
+        };
     }
 
     return party_states;
@@ -387,7 +389,7 @@ std::unordered_map<unsigned int, PartyState> SnapshotParties(const PartyRange& p
 std::array<float, kRegionPartySlots> BuildRegionPartyContacts(
     const std::array<FamilyAggregate, kRegionPartySlots>& regional_families,
     const std::array<unsigned int, REGION_COUNT>& region_totals,
-    const std::unordered_map<unsigned int, PartyState>& party_states) {
+    const std::array<PartyState, PARTY_COUNT>& party_states) {
     std::array<float, kRegionPartySlots> contacts = ZeroRegionPartyContact();
 
     for (unsigned int region_id = 0u; region_id < REGION_COUNT; ++region_id) {
@@ -448,9 +450,8 @@ std::array<float, kRegionPartySlots> BuildRegionPartyContacts(
                     break;
             }
 
-            const auto state_it = party_states.find(party_id);
-            if (state_it != party_states.end()) {
-                const PartyState& state = state_it->second;
+            const PartyState& state = party_states[party_id];
+            if (state.active) {
                 const bool major_party = IsMajorParty(party_id);
                 contact = ClampFloat(
                     contact * (major_party
@@ -1143,8 +1144,7 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
 
     const auto statewide_families = CollapseStatewideFamilies(regional_families);
 
-    std::unordered_map<unsigned int, PartyState> party_states;
-    party_states.reserve(PARTY_COUNT);
+    std::array<PartyState, PARTY_COUNT> party_states{};
 
     const auto add_major_party = [&](const unsigned int party_id, const float anchor_ideology) {
         const FamilyAggregate& aggregate = statewide_families[party_id];
@@ -1158,7 +1158,7 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
         const float fundraising = ClampFloat(0.58f + 0.30f * share + 0.18f * avg_donor + 0.08f * regional_depth, 0.45f, 1.0f);
         const float media_reach = ClampFloat(0.48f + 0.26f * fundraising + 0.12f * avg_skill + 0.10f * avg_launch, 0.38f, 1.0f);
 
-        party_states.emplace(party_id, PartyState{
+        party_states[party_id] = PartyState{
             party_id,
             ClampFloat(0.70f * anchor_ideology + 0.30f * avg_ideology, -1.0f, 1.0f),
             ClampFloat(0.72f + 0.95f * share + 0.10f * avg_skill, 0.60f, 1.0f),
@@ -1169,7 +1169,8 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
             ClampFloat(0.42f + 0.35f * share + 0.10f * avg_launch, 0.24f, 0.88f),
             fundraising,
             media_reach,
-        });
+            true,  // active
+        };
     };
 
     add_major_party(DEM, -0.35f);
@@ -1212,7 +1213,7 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
         const float base_organization = ClampFloat(0.06f + 2.40f * share + 0.16f * avg_skill + 0.12f * avg_donor + 0.10f * regional_depth, 0.0f, 0.90f);
         const float fundraising = ClampFloat(0.03f + 1.25f * share + 0.24f * avg_donor + 0.10f * regional_depth, 0.0f, 0.72f);
         const float media_reach = ClampFloat(0.02f + 0.42f * fundraising + 0.10f * avg_launch + 0.08f * regional_depth, 0.0f, 0.72f);
-        party_states.emplace(family, PartyState{
+        party_states[family] = PartyState{
             family,
             ideology,
             base_organization,
@@ -1223,23 +1224,26 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
             ClampFloat(0.08f + 0.45f * share + 0.10f * avg_launch, 0.0f, 0.60f),
             fundraising,
             media_reach,
-        });
+            true,  // active
+        };
     }
 
     auto contacts = BuildRegionPartyContacts(regional_families, region_totals, party_states);
-    for (auto& [party_id, state] : party_states) {
-        state.field_strength = ClampFloat(0.62f * state.field_strength + 0.38f * WeightedPartyContact(contacts, party_id), 0.0f, 1.0f);
-        state.momentum = ClampFloat(0.72f * state.momentum + 0.28f * state.projected_viability, 0.0f, 1.0f);
+    for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
+        PartyState& state = party_states[party_id];
+        if (state.active) {
+            state.field_strength = ClampFloat(0.62f * state.field_strength + 0.38f * WeightedPartyContact(contacts, party_id), 0.0f, 1.0f);
+            state.momentum = ClampFloat(0.72f * state.momentum + 0.28f * state.projected_viability, 0.0f, 1.0f);
+        }
     }
     contacts = BuildRegionPartyContacts(regional_families, region_totals, party_states);
     FLAMEGPU->environment.setProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", contacts);
 
-    for (unsigned int party_id : {DEM, REP, GREEN, LIBERTARIAN, CENTRIST, POPULIST}) {
-        const auto state_it = party_states.find(party_id);
-        if (state_it == party_states.end()) {
+    for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
+        const PartyState& state = party_states[party_id];
+        if (!state.active) {
             continue;
         }
-        const PartyState& state = state_it->second;
         flamegpu::HostNewAgentAPI party = party_agents.newAgent();
         party.setVariable<unsigned int>("party_id", state.party_id);
         party.setVariable<float>("ideology", state.ideology);
@@ -1285,11 +1289,11 @@ FLAMEGPU_STEP_FUNCTION(AdvanceCampaignAndAllocateSeats) {
         const auto existing_contacts = FLAMEGPU->environment.getProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT");
 
         for (const PartyResult& result : results) {
-            auto state_it = party_states.find(result.party_id);
-            if (state_it == party_states.end()) {
+            if (result.party_id >= PARTY_COUNT) continue;
+            PartyState& state = party_states[result.party_id];
+            if (!state.active) {
                 continue;
             }
-            PartyState& state = state_it->second;
             const float contact = WeightedPartyContact(existing_contacts, state.party_id);
             const bool major_party = IsMajorParty(state.party_id);
             const FamilyAggregate& aggregate = statewide_families[state.party_id];
@@ -1340,11 +1344,11 @@ FLAMEGPU_STEP_FUNCTION(AdvanceCampaignAndAllocateSeats) {
 
         for (auto party : parties) {
             const unsigned int party_id = party.getVariable<unsigned int>("party_id");
-            const auto state_it = party_states.find(party_id);
-            if (state_it == party_states.end()) {
+            if (party_id >= PARTY_COUNT) continue;
+            const PartyState& state = party_states[party_id];
+            if (!state.active) {
                 continue;
             }
-            const PartyState& state = state_it->second;
             party.setVariable<float>("ideology", state.ideology);
             party.setVariable<float>("organization", state.organization);
             party.setVariable<float>("brand", state.brand);
