@@ -76,6 +76,7 @@ struct PartyState {
     float momentum = 0.0f;
     float fundraising = 0.0f;
     float media_reach = 0.0f;
+    bool active = false;
 };
 
 struct PartyResult {
@@ -83,6 +84,17 @@ struct PartyResult {
     std::uint64_t votes = 0u;
     float share = 0.0f;
     unsigned int seats = 0u;
+};
+
+struct SimulationArtifactConfig {
+    unsigned int total_voters;
+    unsigned int total_valid;
+    unsigned int abstentions;
+    float turnout_share;
+    float threshold;
+    unsigned int seats;
+    unsigned int divisor_method;
+    unsigned int campaign_steps;
 };
 
 struct RegionProfile {
@@ -309,13 +321,13 @@ float ComputeRegionalBreadth(
 }
 
 template <typename PartyRange>
-std::unordered_map<unsigned int, PartyState> SnapshotParties(const PartyRange& parties) {
-    std::unordered_map<unsigned int, PartyState> party_states;
-    party_states.reserve(PARTY_COUNT);
+std::array<PartyState, PARTY_COUNT> SnapshotParties(const PartyRange& parties) {
+    std::array<PartyState, PARTY_COUNT> party_states{};
 
     for (const auto& party : parties) {
         const unsigned int party_id = party.template getVariable<unsigned int>("party_id");
-        party_states.emplace(party_id, PartyState{
+        if (party_id >= PARTY_COUNT) continue;
+        party_states[party_id] = PartyState{
             party_id,
             party.template getVariable<float>("ideology"),
             party.template getVariable<float>("organization"),
@@ -326,7 +338,8 @@ std::unordered_map<unsigned int, PartyState> SnapshotParties(const PartyRange& p
             party.template getVariable<float>("momentum"),
             party.template getVariable<float>("fundraising"),
             party.template getVariable<float>("media_reach"),
-        });
+            true,  // active
+        };
     }
 
     return party_states;
@@ -335,7 +348,7 @@ std::unordered_map<unsigned int, PartyState> SnapshotParties(const PartyRange& p
 std::array<float, kRegionPartySlots> BuildRegionPartyContacts(
     const std::array<FamilyAggregate, kRegionPartySlots>& regional_families,
     const std::array<unsigned int, REGION_COUNT>& region_totals,
-    const std::unordered_map<unsigned int, PartyState>& party_states) {
+    const std::array<PartyState, PARTY_COUNT>& party_states) {
     std::array<float, kRegionPartySlots> contacts = ZeroRegionPartyContact();
 
     for (unsigned int region_id = 0u; region_id < REGION_COUNT; ++region_id) {
@@ -396,9 +409,8 @@ std::array<float, kRegionPartySlots> BuildRegionPartyContacts(
                     break;
             }
 
-            const auto state_it = party_states.find(party_id);
-            if (state_it != party_states.end()) {
-                const PartyState& state = state_it->second;
+            const PartyState& state = party_states[party_id];
+            if (state.active) {
                 const bool major_party = IsMajorParty(party_id);
                 contact = ClampFloat(
                     contact * (major_party
@@ -499,10 +511,7 @@ std::vector<PartyResult> BuildParliamentOrdering(const std::vector<PartyResult>&
 
 std::string BuildParliamentSvg(
     const std::vector<PartyResult>& results,
-    const unsigned int total_seats,
-    const float turnout_share,
-    const float threshold,
-    const unsigned int divisor_method) {
+    const SimulationArtifactConfig& config) {
     const float width = 1100.0f;
     const float height = 760.0f;
     const float center_x = 390.0f;
@@ -511,7 +520,7 @@ std::string BuildParliamentSvg(
     const float ring_gap = 42.0f;
     const float seat_radius = 9.0f;
     const unsigned int rows = 5u;
-    const unsigned int majority = total_seats / 2u + 1u;
+    const unsigned int majority = config.seats / 2u + 1u;
 
     std::vector<float> radii(rows);
     float total_weight = 0.0f;
@@ -524,10 +533,10 @@ std::string BuildParliamentSvg(
     unsigned int assigned_seats = 0u;
     for (unsigned int row = 0u; row < rows; ++row) {
         row_counts[row] = std::max(1u, static_cast<unsigned int>(std::lround(
-            static_cast<float>(total_seats) * radii[row] / total_weight)));
+            static_cast<float>(config.seats) * radii[row] / total_weight)));
         assigned_seats += row_counts[row];
     }
-    while (assigned_seats > total_seats) {
+    while (assigned_seats > config.seats) {
         const auto max_it = std::max_element(row_counts.begin(), row_counts.end());
         if (*max_it <= 1u) {
             break;
@@ -535,20 +544,20 @@ std::string BuildParliamentSvg(
         --(*max_it);
         --assigned_seats;
     }
-    while (assigned_seats < total_seats) {
+    while (assigned_seats < config.seats) {
         const auto min_it = std::min_element(row_counts.begin(), row_counts.end());
         ++(*min_it);
-        ++assigned_seats;
+        assigned_seats++;
     }
 
     std::vector<unsigned int> seat_parties;
-    seat_parties.reserve(total_seats);
+    seat_parties.reserve(config.seats);
     for (const PartyResult& result : BuildParliamentOrdering(results)) {
         for (unsigned int seat = 0u; seat < result.seats; ++seat) {
             seat_parties.push_back(result.party_id);
         }
     }
-    while (seat_parties.size() < total_seats) {
+    while (seat_parties.size() < config.seats) {
         seat_parties.push_back(kAbstain);
     }
 
@@ -558,8 +567,8 @@ std::string BuildParliamentSvg(
     svg << "<rect width=\"100%\" height=\"100%\" fill=\"#f8fafc\"/>\n";
     svg << "<text x=\"56\" y=\"58\" font-size=\"30\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#0f172a\">Wisconsin PR Simulation</text>\n";
     svg << "<text x=\"56\" y=\"92\" font-size=\"15\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#475569\">"
-        << "Parliament chart, turnout " << std::fixed << std::setprecision(1) << turnout_share * 100.0f
-        << "%, threshold " << threshold * 100.0f << "%, " << DivisorMethodLabel(divisor_method) << "</text>\n";
+        << "Parliament chart, turnout " << std::fixed << std::setprecision(1) << config.turnout_share * 100.0f
+        << "%, threshold " << config.threshold * 100.0f << "%, " << DivisorMethodLabel(config.divisor_method) << "</text>\n";
     svg << "<text x=\"56\" y=\"126\" font-size=\"14\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#334155\">"
         << "Majority: " << majority << " seats</text>\n";
 
@@ -599,21 +608,14 @@ std::string BuildParliamentSvg(
 
 void WriteResultsArtifacts(
     const std::vector<PartyResult>& results,
-    const unsigned int total_voters,
-    const unsigned int total_valid,
-    const unsigned int abstentions,
-    const float turnout_share,
-    const float threshold,
-    const unsigned int seats,
-    const unsigned int divisor_method,
-    const unsigned int campaign_steps) {
+    const SimulationArtifactConfig& config) {
     const std::filesystem::path report_dir = ResolveReportDirectory();
     std::filesystem::create_directories(report_dir);
 
     const std::filesystem::path svg_path = report_dir / "wisconsin_pr_results.svg";
     const std::filesystem::path html_path = report_dir / "wisconsin_pr_results.html";
 
-    const std::string svg = BuildParliamentSvg(results, seats, turnout_share, threshold, divisor_method);
+    const std::string svg = BuildParliamentSvg(results, config);
     {
         std::ofstream svg_file(svg_path, std::ios::out | std::ios::trunc);
         svg_file << svg;
@@ -629,13 +631,13 @@ void WriteResultsArtifacts(
          << ".meta{display:grid;grid-template-columns:repeat(2,minmax(140px,1fr));gap:12px 18px;margin:16px 0 6px;}"
          << ".meta div{background:#f8fafc;border-radius:14px;padding:10px 12px;}</style></head><body>";
     html << "<div class=\"wrap\"><div class=\"card\"><h1>Wisconsin PR Simulation</h1><p>"
-         << "Campaign steps " << campaign_steps << ", threshold " << std::fixed << std::setprecision(1) << threshold * 100.0f
-         << "%, divisor " << DivisorMethodLabel(divisor_method) << ".</p>" << svg << "</div>";
+         << "Campaign steps " << config.campaign_steps << ", threshold " << std::fixed << std::setprecision(1) << config.threshold * 100.0f
+         << "%, divisor " << DivisorMethodLabel(config.divisor_method) << ".</p>" << svg << "</div>";
     html << "<div class=\"card\"><h2>Summary</h2><div class=\"meta\">"
-         << "<div><strong>Total voters</strong><br>" << total_voters << "</div>"
-         << "<div><strong>Valid votes</strong><br>" << total_valid << "</div>"
-         << "<div><strong>Abstentions</strong><br>" << abstentions << "</div>"
-         << "<div><strong>Turnout</strong><br>" << std::fixed << std::setprecision(2) << turnout_share * 100.0f << "%</div>"
+         << "<div><strong>Total voters</strong><br>" << config.total_voters << "</div>"
+         << "<div><strong>Valid votes</strong><br>" << config.total_valid << "</div>"
+         << "<div><strong>Abstentions</strong><br>" << config.abstentions << "</div>"
+         << "<div><strong>Turnout</strong><br>" << std::fixed << std::setprecision(2) << config.turnout_share * 100.0f << "%</div>"
          << "</div><table><thead><tr><th>Party</th><th>Votes</th><th>Share</th><th>Seats</th></tr></thead><tbody>";
     for (const PartyResult& result : results) {
         html << "<tr><td><span class=\"swatch\" style=\"background:" << PartyColor(result.party_id) << "\"></span>"
@@ -1091,8 +1093,7 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
 
     const auto statewide_families = CollapseStatewideFamilies(regional_families);
 
-    std::unordered_map<unsigned int, PartyState> party_states;
-    party_states.reserve(PARTY_COUNT);
+    std::array<PartyState, PARTY_COUNT> party_states{};
 
     const auto add_major_party = [&](const unsigned int party_id, const float anchor_ideology) {
         const FamilyAggregate& aggregate = statewide_families[party_id];
@@ -1106,7 +1107,7 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
         const float fundraising = ClampFloat(0.58f + 0.30f * share + 0.18f * avg_donor + 0.08f * regional_depth, 0.45f, 1.0f);
         const float media_reach = ClampFloat(0.48f + 0.26f * fundraising + 0.12f * avg_skill + 0.10f * avg_launch, 0.38f, 1.0f);
 
-        party_states.emplace(party_id, PartyState{
+        party_states[party_id] = PartyState{
             party_id,
             ClampFloat(0.70f * anchor_ideology + 0.30f * avg_ideology, -1.0f, 1.0f),
             ClampFloat(0.72f + 0.95f * share + 0.10f * avg_skill, 0.60f, 1.0f),
@@ -1117,7 +1118,8 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
             ClampFloat(0.42f + 0.35f * share + 0.10f * avg_launch, 0.24f, 0.88f),
             fundraising,
             media_reach,
-        });
+            true,  // active
+        };
     };
 
     add_major_party(DEM, -0.35f);
@@ -1160,7 +1162,7 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
         const float base_organization = ClampFloat(0.06f + 2.40f * share + 0.16f * avg_skill + 0.12f * avg_donor + 0.10f * regional_depth, 0.0f, 0.90f);
         const float fundraising = ClampFloat(0.03f + 1.25f * share + 0.24f * avg_donor + 0.10f * regional_depth, 0.0f, 0.72f);
         const float media_reach = ClampFloat(0.02f + 0.42f * fundraising + 0.10f * avg_launch + 0.08f * regional_depth, 0.0f, 0.72f);
-        party_states.emplace(family, PartyState{
+        party_states[family] = PartyState{
             family,
             ideology,
             base_organization,
@@ -1171,23 +1173,26 @@ FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
             ClampFloat(0.08f + 0.45f * share + 0.10f * avg_launch, 0.0f, 0.60f),
             fundraising,
             media_reach,
-        });
+            true,  // active
+        };
     }
 
     auto contacts = BuildRegionPartyContacts(regional_families, region_totals, party_states);
-    for (auto& [party_id, state] : party_states) {
-        state.field_strength = ClampFloat(0.62f * state.field_strength + 0.38f * WeightedPartyContact(contacts, party_id), 0.0f, 1.0f);
-        state.momentum = ClampFloat(0.72f * state.momentum + 0.28f * state.projected_viability, 0.0f, 1.0f);
+    for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
+        PartyState& state = party_states[party_id];
+        if (state.active) {
+            state.field_strength = ClampFloat(0.62f * state.field_strength + 0.38f * WeightedPartyContact(contacts, party_id), 0.0f, 1.0f);
+            state.momentum = ClampFloat(0.72f * state.momentum + 0.28f * state.projected_viability, 0.0f, 1.0f);
+        }
     }
     contacts = BuildRegionPartyContacts(regional_families, region_totals, party_states);
     FLAMEGPU->environment.setProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", contacts);
 
-    for (unsigned int party_id : {DEM, REP, GREEN, LIBERTARIAN, CENTRIST, POPULIST}) {
-        const auto state_it = party_states.find(party_id);
-        if (state_it == party_states.end()) {
+    for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
+        const PartyState& state = party_states[party_id];
+        if (!state.active) {
             continue;
         }
-        const PartyState& state = state_it->second;
         flamegpu::HostNewAgentAPI party = party_agents.newAgent();
         party.setVariable<unsigned int>("party_id", state.party_id);
         party.setVariable<float>("ideology", state.ideology);
@@ -1233,11 +1238,11 @@ FLAMEGPU_STEP_FUNCTION(AdvanceCampaignAndAllocateSeats) {
         const auto existing_contacts = FLAMEGPU->environment.getProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT");
 
         for (const PartyResult& result : results) {
-            auto state_it = party_states.find(result.party_id);
-            if (state_it == party_states.end()) {
+            if (result.party_id >= PARTY_COUNT) continue;
+            PartyState& state = party_states[result.party_id];
+            if (!state.active) {
                 continue;
             }
-            PartyState& state = state_it->second;
             const float contact = WeightedPartyContact(existing_contacts, state.party_id);
             const bool major_party = IsMajorParty(state.party_id);
             const FamilyAggregate& aggregate = statewide_families[state.party_id];
@@ -1288,11 +1293,11 @@ FLAMEGPU_STEP_FUNCTION(AdvanceCampaignAndAllocateSeats) {
 
         for (auto party : parties) {
             const unsigned int party_id = party.getVariable<unsigned int>("party_id");
-            const auto state_it = party_states.find(party_id);
-            if (state_it == party_states.end()) {
+            if (party_id >= PARTY_COUNT) continue;
+            const PartyState& state = party_states[party_id];
+            if (!state.active) {
                 continue;
             }
-            const PartyState& state = state_it->second;
             party.setVariable<float>("ideology", state.ideology);
             party.setVariable<float>("organization", state.organization);
             party.setVariable<float>("brand", state.brand);
@@ -1344,7 +1349,17 @@ FLAMEGPU_STEP_FUNCTION(AdvanceCampaignAndAllocateSeats) {
             result.seats,
             status);
     }
-    WriteResultsArtifacts(results, total_voters, total_valid, abstentions, turnout_share, threshold, seats, divisor_method, campaign_steps);
+    const SimulationArtifactConfig config{
+        total_voters,
+        total_valid,
+        abstentions,
+        turnout_share,
+        threshold,
+        seats,
+        divisor_method,
+        campaign_steps
+    };
+    WriteResultsArtifacts(results, config);
 }
 
 void BuildModel(
