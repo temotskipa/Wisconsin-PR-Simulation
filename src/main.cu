@@ -89,6 +89,17 @@ struct PartyResult {
     unsigned int seats = 0u;
 };
 
+struct SimulationArtifactConfig {
+    unsigned int total_voters;
+    unsigned int total_valid;
+    unsigned int abstentions;
+    float turnout_share;
+    float threshold;
+    unsigned int seats;
+    unsigned int divisor_method;
+    unsigned int campaign_steps;
+};
+
 struct RegionProfile {
     const char* label;
     float population_share;
@@ -551,10 +562,7 @@ std::vector<PartyResult> BuildParliamentOrdering(const std::vector<PartyResult>&
 
 std::string BuildParliamentSvg(
     const std::vector<PartyResult>& results,
-    const unsigned int total_seats,
-    const float turnout_share,
-    const float threshold,
-    const unsigned int divisor_method) {
+    const SimulationArtifactConfig& config) {
     const float width = 1100.0f;
     const float height = 760.0f;
     const float center_x = 390.0f;
@@ -563,7 +571,7 @@ std::string BuildParliamentSvg(
     const float ring_gap = 42.0f;
     const float seat_radius = 9.0f;
     const unsigned int rows = 5u;
-    const unsigned int majority = total_seats / 2u + 1u;
+    const unsigned int majority = config.seats / 2u + 1u;
 
     std::vector<float> radii(rows);
     float total_weight = 0.0f;
@@ -576,10 +584,10 @@ std::string BuildParliamentSvg(
     unsigned int assigned_seats = 0u;
     for (unsigned int row = 0u; row < rows; ++row) {
         row_counts[row] = std::max(1u, static_cast<unsigned int>(std::lround(
-            static_cast<float>(total_seats) * radii[row] / total_weight)));
+            static_cast<float>(config.seats) * radii[row] / total_weight)));
         assigned_seats += row_counts[row];
     }
-    while (assigned_seats > total_seats) {
+    while (assigned_seats > config.seats) {
         const auto max_it = std::max_element(row_counts.begin(), row_counts.end());
         if (*max_it <= 1u) {
             break;
@@ -587,20 +595,20 @@ std::string BuildParliamentSvg(
         --(*max_it);
         --assigned_seats;
     }
-    while (assigned_seats < total_seats) {
+    while (assigned_seats < config.seats) {
         const auto min_it = std::min_element(row_counts.begin(), row_counts.end());
         ++(*min_it);
-        ++assigned_seats;
+        assigned_seats++;
     }
 
     std::vector<unsigned int> seat_parties;
-    seat_parties.reserve(total_seats);
+    seat_parties.reserve(config.seats);
     for (const PartyResult& result : BuildParliamentOrdering(results)) {
         for (unsigned int seat = 0u; seat < result.seats; ++seat) {
             seat_parties.push_back(result.party_id);
         }
     }
-    while (seat_parties.size() < total_seats) {
+    while (seat_parties.size() < config.seats) {
         seat_parties.push_back(kAbstain);
     }
 
@@ -610,8 +618,8 @@ std::string BuildParliamentSvg(
     svg << "<rect width=\"100%\" height=\"100%\" fill=\"#f8fafc\"/>\n";
     svg << "<text x=\"56\" y=\"58\" font-size=\"30\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#0f172a\">Wisconsin PR Simulation</text>\n";
     svg << "<text x=\"56\" y=\"92\" font-size=\"15\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#475569\">"
-        << "Parliament chart, turnout " << std::fixed << std::setprecision(1) << turnout_share * 100.0f
-        << "%, threshold " << threshold * 100.0f << "%, " << DivisorMethodLabel(divisor_method) << "</text>\n";
+        << "Parliament chart, turnout " << std::fixed << std::setprecision(1) << config.turnout_share * 100.0f
+        << "%, threshold " << config.threshold * 100.0f << "%, " << DivisorMethodLabel(config.divisor_method) << "</text>\n";
     svg << "<text x=\"56\" y=\"126\" font-size=\"14\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#334155\">"
         << "Majority: " << majority << " seats</text>\n";
 
@@ -651,21 +659,14 @@ std::string BuildParliamentSvg(
 
 void WriteResultsArtifacts(
     const std::vector<PartyResult>& results,
-    const unsigned int total_voters,
-    const unsigned int total_valid,
-    const unsigned int abstentions,
-    const float turnout_share,
-    const float threshold,
-    const unsigned int seats,
-    const unsigned int divisor_method,
-    const unsigned int campaign_steps) {
+    const SimulationArtifactConfig& config) {
     const std::filesystem::path report_dir = ResolveReportDirectory();
     std::filesystem::create_directories(report_dir);
 
     const std::filesystem::path svg_path = report_dir / "wisconsin_pr_results.svg";
     const std::filesystem::path html_path = report_dir / "wisconsin_pr_results.html";
 
-    const std::string svg = BuildParliamentSvg(results, seats, turnout_share, threshold, divisor_method);
+    const std::string svg = BuildParliamentSvg(results, config);
     {
         std::ofstream svg_file(svg_path, std::ios::out | std::ios::trunc);
         svg_file << svg;
@@ -681,13 +682,13 @@ void WriteResultsArtifacts(
          << ".meta{display:grid;grid-template-columns:repeat(2,minmax(140px,1fr));gap:12px 18px;margin:16px 0 6px;}"
          << ".meta div{background:#f8fafc;border-radius:14px;padding:10px 12px;}</style></head><body>";
     html << "<div class=\"wrap\"><div class=\"card\"><h1>Wisconsin PR Simulation</h1><p>"
-         << "Campaign steps " << campaign_steps << ", threshold " << std::fixed << std::setprecision(1) << threshold * 100.0f
-         << "%, divisor " << DivisorMethodLabel(divisor_method) << ".</p>" << svg << "</div>";
+         << "Campaign steps " << config.campaign_steps << ", threshold " << std::fixed << std::setprecision(1) << config.threshold * 100.0f
+         << "%, divisor " << DivisorMethodLabel(config.divisor_method) << ".</p>" << svg << "</div>";
     html << "<div class=\"card\"><h2>Summary</h2><div class=\"meta\">"
-         << "<div><strong>Total voters</strong><br>" << total_voters << "</div>"
-         << "<div><strong>Valid votes</strong><br>" << total_valid << "</div>"
-         << "<div><strong>Abstentions</strong><br>" << abstentions << "</div>"
-         << "<div><strong>Turnout</strong><br>" << std::fixed << std::setprecision(2) << turnout_share * 100.0f << "%</div>"
+         << "<div><strong>Total voters</strong><br>" << config.total_voters << "</div>"
+         << "<div><strong>Valid votes</strong><br>" << config.total_valid << "</div>"
+         << "<div><strong>Abstentions</strong><br>" << config.abstentions << "</div>"
+         << "<div><strong>Turnout</strong><br>" << std::fixed << std::setprecision(2) << config.turnout_share * 100.0f << "%</div>"
          << "</div><table><thead><tr><th>Party</th><th>Votes</th><th>Share</th><th>Seats</th></tr></thead><tbody>";
     for (const PartyResult& result : results) {
         html << "<tr><td><span class=\"swatch\" style=\"background:" << PartyColor(result.party_id) << "\"></span>"
@@ -1396,7 +1397,17 @@ FLAMEGPU_STEP_FUNCTION(AdvanceCampaignAndAllocateSeats) {
             result.seats,
             status);
     }
-    WriteResultsArtifacts(results, total_voters, total_valid, abstentions, turnout_share, threshold, seats, divisor_method, campaign_steps);
+    const SimulationArtifactConfig config{
+        total_voters,
+        total_valid,
+        abstentions,
+        turnout_share,
+        threshold,
+        seats,
+        divisor_method,
+        campaign_steps
+    };
+    WriteResultsArtifacts(results, config);
 }
 
 void BuildModel(
