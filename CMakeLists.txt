@@ -28,6 +28,7 @@ SET(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin/${CMAKE_BUILD
 # Manually list all of the files which require building or influence re-building (i.e. headers).
 SET(ALL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/util.cpp
 )
 
 # Add the executable and set required flags for the target
@@ -35,6 +36,13 @@ flamegpu_add_executable("${PROJECT_NAME}" "${ALL_SRC}" "${FLAMEGPU_ROOT}" "${PRO
 
 # Add src directory to include path
 target_include_directories("${PROJECT_NAME}" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+# Add test executable
+add_executable(test_util
+    src/test_util.cpp
+    src/util.cpp
+)
+target_include_directories(test_util PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Also set as (visual studio) startup project
 set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY VS_STARTUP_PROJECT "${PROJECT_NAME}")
