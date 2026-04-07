@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cinttypes>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -20,58 +21,76 @@
 
 namespace wisconsin_pr {
 
+// ===== CONSTANTS =====
+
 constexpr char kModelName[] = "Wisconsin PR Simulation";
-constexpr unsigned int kDefaultSeats = 99;
-constexpr float kDefaultThreshold = 0.05f;
-constexpr unsigned int kDefaultRandomSeed = 42;
+constexpr unsigned int MAX_PARTIES = 16u;
+constexpr unsigned int kDefaultSeats = 99u;
+constexpr unsigned int kDefaultRandomSeed = 42u;
 constexpr unsigned int kDefaultVoterCount = 5970000u;
 constexpr unsigned int kDefaultActivistCount = 2500u;
 constexpr float kDefaultMinorEntryShare = 0.020f;
 constexpr unsigned int kDefaultCampaignSteps = 6u;
+constexpr unsigned int kDefaultOrganizingSteps = 3u;
 constexpr unsigned int kAbstain = 999u;
 constexpr float kPi = 3.14159265358979323846f;
+constexpr float kSpatialMin = 0.0f;
+constexpr float kSpatialMax = 100.0f;
+constexpr float kSpatialRadius = 0.4f;
+constexpr unsigned int CLUSTER_GRID = 10u;
+constexpr unsigned int MIN_CLUSTER_ACTIVISTS = 30u;
 
-enum PartyId : unsigned int {
-    DEM = 0u,
-    REP = 1u,
-    GREEN = 2u,
-    LIBERTARIAN = 3u,
-    CENTRIST = 4u,
-    POPULIST = 5u,
-    PARTY_COUNT = 6u,
-};
+// ===== ENUMS (no PartyId — parties are dynamic) =====
 
-enum DivisorMethod : unsigned int {
-    SAINTE_LAGUE = 0u,
-    DHONDT = 1u,
-};
+enum DivisorMethod : unsigned int { SAINTE_LAGUE = 0u, DHONDT = 1u };
 
 enum RegionId : unsigned int {
-    MILWAUKEE_METRO = 0u,
-    DANE_METRO = 1u,
-    WOW_SUBURBS = 2u,
-    SOUTHEAST_INDUSTRIAL = 3u,
-    FOX_VALLEY = 4u,
-    DRIFTLESS_WEST = 5u,
-    NORTHWOODS = 6u,
-    RURAL_HEARTLAND = 7u,
-    REGION_COUNT = 8u,
+    MILWAUKEE_METRO = 0u, DANE_METRO = 1u, WOW_SUBURBS = 2u,
+    SOUTHEAST_INDUSTRIAL = 3u, FOX_VALLEY = 4u, DRIFTLESS_WEST = 5u,
+    NORTHWOODS = 6u, RURAL_HEARTLAND = 7u, REGION_COUNT = 8u,
 };
 
-constexpr unsigned int kRegionPartySlots = REGION_COUNT * PARTY_COUNT;
+constexpr unsigned int kRegionPartySlots = REGION_COUNT * MAX_PARTIES;
 
-struct FamilyAggregate {
+// ===== STRUCTS =====
+
+struct RegionProfile {
+    const char* label;
+    float population_share;
+    float econ_shift;       // regional economic ideology deviation
+    float social_shift;     // regional social ideology deviation
+    float urbanity;
+    float turnout_bonus;
+    float college_share;
+    float union_share;
+    float religiosity;
+    float activist_density;
+    float center_x;         // spatial centroid
+    float center_y;
+};
+
+struct IdeologyCluster {
     unsigned int count = 0u;
-    double ideology_sum = 0.0;
+    double econ_sum = 0.0;
+    double social_sum = 0.0;
+    double anti_est_sum = 0.0;
     double organizer_skill_sum = 0.0;
     double donor_access_sum = 0.0;
     double launch_tendency_sum = 0.0;
     double field_reach_sum = 0.0;
+    std::array<unsigned int, REGION_COUNT> region_counts{};
 };
 
 struct PartyState {
     unsigned int party_id = 0u;
-    float ideology = 0.0f;
+    float econ_ideology = 0.0f;
+    float social_ideology = 0.0f;
+    float urban_orientation = 0.5f;
+    float anti_est_posture = 0.0f;
+    float religiosity_align = 0.0f;
+    float union_alignment = 0.0f;
+    float college_alignment = 0.0f;
+    float establishment_age = 0.0f;
     float organization = 0.0f;
     float brand = 0.0f;
     float credibility = 0.0f;
@@ -80,7 +99,10 @@ struct PartyState {
     float momentum = 0.0f;
     float fundraising = 0.0f;
     float media_reach = 0.0f;
-    bool active = false;
+    unsigned int is_alive = 1u;
+    unsigned int is_legacy = 0u;
+    unsigned int consecutive_low_viability = 0u;
+    std::string display_name;
 };
 
 struct PartyResult {
@@ -88,1480 +110,1470 @@ struct PartyResult {
     std::uint64_t votes = 0u;
     float share = 0.0f;
     unsigned int seats = 0u;
+    std::string name;
+    std::string color;
+    float econ_ideology = 0.0f;
 };
 
-struct SimulationArtifactConfig {
-    unsigned int total_voters;
-    unsigned int total_valid;
-    unsigned int abstentions;
-    float turnout_share;
-    float threshold;
-    unsigned int seats;
-    unsigned int divisor_method;
-    unsigned int campaign_steps;
-};
-
-struct RegionProfile {
-    const char* label;
-    float population_share;
-    float ideology_shift;
-    float urbanity;
-    float turnout_bonus;
-    float college_share;
-    float union_share;
-    float religiosity;
-    float green_affinity;
-    float libertarian_affinity;
-    float populist_affinity;
-    float activist_density;
-};
+// ===== REGION DATA (Census ACS 2024, BLS 2025, Pew Research) =====
 
 constexpr std::array<RegionProfile, REGION_COUNT> kRegionProfiles = {{
-    {"Milwaukee Metro", 0.16f, -0.25f, 0.95f, -0.01f, 0.34f, 0.23f, 0.34f, 0.44f, 0.09f, 0.15f, 1.25f},
-    {"Dane / Madison", 0.09f, -0.35f, 0.90f, 0.04f, 0.55f, 0.16f, 0.23f, 0.58f, 0.11f, 0.08f, 1.30f},
-    {"WOW Suburbs", 0.08f, 0.33f, 0.58f, 0.05f, 0.44f, 0.12f, 0.60f, 0.11f, 0.20f, 0.15f, 0.85f},
-    {"Southeast Industrial", 0.13f, 0.02f, 0.52f, 0.03f, 0.31f, 0.24f, 0.48f, 0.17f, 0.10f, 0.26f, 1.05f},
-    {"Fox Valley", 0.14f, 0.12f, 0.44f, 0.03f, 0.29f, 0.18f, 0.56f, 0.14f, 0.17f, 0.23f, 0.95f},
-    {"Driftless West", 0.12f, -0.10f, 0.32f, 0.02f, 0.28f, 0.19f, 0.46f, 0.20f, 0.12f, 0.19f, 0.95f},
-    {"Northwoods", 0.10f, 0.18f, 0.18f, 0.05f, 0.22f, 0.18f, 0.54f, 0.09f, 0.13f, 0.30f, 0.80f},
-    {"Rural Heartland", 0.18f, 0.09f, 0.24f, 0.03f, 0.23f, 0.17f, 0.55f, 0.12f, 0.14f, 0.27f, 0.75f},
+    // label              pop%    econ   social urban  turn   coll   union  relig  activ  cx    cy
+    {"Milwaukee Metro",   0.156f, -0.25f, -0.15f, 0.99f, -0.04f, 0.33f, 0.08f, 0.34f, 1.25f, 85.0f, 30.0f},
+    {"Dane / Madison",    0.097f, -0.35f, -0.40f, 0.85f,  0.05f, 0.55f, 0.07f, 0.23f, 1.30f, 55.0f, 35.0f},
+    {"WOW Suburbs",       0.109f,  0.30f,  0.25f, 0.90f,  0.06f, 0.48f, 0.03f, 0.60f, 0.85f, 78.0f, 35.0f},
+    {"SE Industrial",     0.063f, -0.05f,  0.05f, 0.75f,  0.00f, 0.26f, 0.12f, 0.48f, 1.05f, 85.0f, 20.0f},
+    {"Fox Valley",        0.155f,  0.10f,  0.15f, 0.60f,  0.01f, 0.30f, 0.10f, 0.56f, 0.95f, 70.0f, 55.0f},
+    {"Driftless West",    0.160f, -0.08f, -0.05f, 0.40f,  0.00f, 0.28f, 0.06f, 0.42f, 0.95f, 25.0f, 40.0f},
+    {"Northwoods",        0.101f,  0.15f,  0.20f, 0.25f, -0.01f, 0.21f, 0.04f, 0.50f, 0.80f, 50.0f, 75.0f},
+    {"Rural Heartland",   0.159f,  0.08f,  0.12f, 0.30f,  0.00f, 0.22f, 0.05f, 0.52f, 0.75f, 45.0f, 50.0f},
 }};
 
-FLAMEGPU_HOST_DEVICE_FUNCTION float ClampFloat(const float value, const float lower, const float upper) {
-    return value < lower ? lower : (value > upper ? upper : value);
+// ===== UTILITY FUNCTIONS =====
+
+FLAMEGPU_HOST_DEVICE_FUNCTION float ClampFloat(const float v, const float lo, const float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
 }
 
-std::string SanitizeEnvForLog(const char* raw) {
-    if (!raw) return "";
-    const size_t kMaxLogLen = 128;
-    std::string sanitized;
-    sanitized.reserve(kMaxLogLen + 4);
-    for (size_t i = 0; raw[i] != '\0'; ++i) {
-        if (i >= kMaxLogLen) {
-            sanitized += "...";
-            break;
-        }
-        const unsigned char c = static_cast<unsigned char>(raw[i]);
-        sanitized += std::isprint(c) ? static_cast<char>(c) : '?';
-    }
-    return sanitized;
-}
-
-unsigned int ParseUnsignedEnv(const char* name, const unsigned int default_value) {
+unsigned int ParseUnsignedEnv(const char* name, const unsigned int def) {
     const char* raw = std::getenv(name);
-    if (!raw || !*raw) {
-        return default_value;
-    }
+    if (!raw || !*raw) return def;
     char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(raw, &end, 10);
+    const auto parsed = static_cast<std::uint64_t>(std::strtoull(raw, &end, 10));
     if (end == raw || *end != '\0' || parsed > std::numeric_limits<unsigned int>::max()) {
-        std::printf("Ignoring invalid %s=%s, using %u\n", name, SanitizeEnvForLog(raw).c_str(), default_value);
-        return default_value;
+        std::printf("Ignoring invalid %s=%s, using %u\n", name, raw, def);
+        return def;
     }
     return static_cast<unsigned int>(parsed);
 }
 
-float ParseFloatEnv(const char* name, const float default_value) {
+float ParseFloatEnv(const char* name, const float def) {
     const char* raw = std::getenv(name);
-    if (!raw || !*raw) {
-        return default_value;
-    }
+    if (!raw || !*raw) return def;
     char* end = nullptr;
     const float parsed = std::strtof(raw, &end);
     if (end == raw || *end != '\0') {
-        std::printf("Ignoring invalid %s=%s, using %.3f\n", name, SanitizeEnvForLog(raw).c_str(), default_value);
-        return default_value;
+        std::printf("Ignoring invalid %s=%s, using %.3f\n", name, raw, def);
+        return def;
     }
     return parsed;
 }
 
-unsigned int ParseDivisorMethodEnv(const char* name, const unsigned int default_value) {
+unsigned int ParseDivisorMethodEnv(const char* name, const unsigned int def) {
     const char* raw = std::getenv(name);
-    if (!raw || !*raw) {
-        return default_value;
-    }
-    std::string method(raw);
-    std::transform(method.begin(), method.end(), method.begin(), [](const unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    if (method == "sainte_lague" || method == "sainte-lague" || method == "saintelague") {
-        return SAINTE_LAGUE;
-    }
-    if (method == "dhondt" || method == "d_hondt" || method == "d-hondt" || method == "d'hondt") {
-        return DHONDT;
-    }
-    std::printf("Ignoring invalid %s=%s, using %s\n", name, SanitizeEnvForLog(raw).c_str(),
-        default_value == DHONDT ? "dhondt" : "sainte_lague");
-    return default_value;
+    if (!raw || !*raw) return def;
+    std::string m(raw);
+    std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (m == "sainte_lague" || m == "sainte-lague" || m == "saintelague") return SAINTE_LAGUE;
+    if (m == "dhondt" || m == "d_hondt" || m == "d-hondt" || m == "d'hondt") return DHONDT;
+    std::printf("Ignoring invalid %s=%s, using %s\n", name, raw, def == DHONDT ? "dhondt" : "sainte_lague");
+    return def;
 }
 
-const char* PartyLabel(const unsigned int party_id) {
-    switch (party_id) {
-        case DEM: return "Democratic";
-        case REP: return "Republican";
-        case GREEN: return "Green";
-        case LIBERTARIAN: return "Libertarian";
-        case CENTRIST: return "Forward/Centrist";
-        case POPULIST: return "Rural Populist";
-        default: return "Unknown";
-    }
-}
-
-const char* PartyColor(const unsigned int party_id) {
-    switch (party_id) {
-        case DEM: return "#2563eb";
-        case REP: return "#dc2626";
-        case GREEN: return "#15803d";
-        case LIBERTARIAN: return "#ca8a04";
-        case CENTRIST: return "#0891b2";
-        case POPULIST: return "#b45309";
-        default: return "#6b7280";
-    }
-}
-
-unsigned int PartySeatOrder(const unsigned int party_id) {
-    switch (party_id) {
-        case GREEN: return 0u;
-        case DEM: return 1u;
-        case CENTRIST: return 2u;
-        case POPULIST: return 3u;
-        case REP: return 4u;
-        case LIBERTARIAN: return 5u;
-        default: return PARTY_COUNT;
-    }
-}
-
-FLAMEGPU_HOST_DEVICE_FUNCTION bool IsMajorParty(const unsigned int party_id) {
-    return party_id == DEM || party_id == REP;
-}
-
-const char* DivisorMethodLabel(const unsigned int method) {
-    return method == DHONDT ? "dhondt" : "sainte_lague";
-}
-
-unsigned int ChoosePartyFamily(const float ideology, const float anti_establishment) {
-    if (fabsf(ideology) < 0.12f) {
-        if (anti_establishment > 0.74f) {
-            return POPULIST;
-        }
-        return CENTRIST;
-    }
-    if (ideology < -0.62f && anti_establishment > 0.58f) {
-        return GREEN;
-    }
-    if (ideology > 0.70f && anti_establishment > 0.68f) {
-        return LIBERTARIAN;
-    }
-    if (anti_establishment > 0.80f) {
-        return POPULIST;
-    }
-    return ideology < 0.0f ? DEM : REP;
-}
-
-double DivisorValue(const unsigned int seats_already_awarded, const unsigned int method) {
-    if (method == DHONDT) {
-        return static_cast<double>(seats_already_awarded + 1u);
-    }
-    return static_cast<double>(2u * seats_already_awarded + 1u);
-}
-
-std::unordered_map<unsigned int, unsigned int> AllocateDivisorSeats(
-    const std::vector<std::pair<unsigned int, std::uint64_t>>& qualified_votes,
-    const unsigned int total_seats,
-    const unsigned int method) {
-    std::unordered_map<unsigned int, unsigned int> seat_counts;
-    seat_counts.reserve(qualified_votes.size());
-    for (const auto& [party_id, _] : qualified_votes) {
-        seat_counts.emplace(party_id, 0u);
-    }
-
-    for (unsigned int seat = 0u; seat < total_seats; ++seat) {
-        unsigned int best_party = qualified_votes.front().first;
-        double best_quotient = -1.0;
-        for (const auto& [party_id, votes] : qualified_votes) {
-            const unsigned int seats_awarded = seat_counts[party_id];
-            const double quotient = static_cast<double>(votes) / DivisorValue(seats_awarded, method);
-            if (quotient > best_quotient) {
-                best_quotient = quotient;
-                best_party = party_id;
-            }
-        }
-        ++seat_counts[best_party];
-    }
-
-    return seat_counts;
-}
-
-FLAMEGPU_HOST_DEVICE_FUNCTION unsigned int FlattenRegionPartyIndex(const unsigned int region_id, const unsigned int party_id) {
-    return region_id * PARTY_COUNT + party_id;
-}
-
-unsigned int ChooseRegion(const float draw, const bool activist_weighted) {
-    float total_weight = 0.0f;
-    for (const RegionProfile& region : kRegionProfiles) {
-        total_weight += region.population_share * (activist_weighted ? region.activist_density : 1.0f);
-    }
-
-    float cumulative = 0.0f;
-    for (unsigned int region_id = 0u; region_id < REGION_COUNT; ++region_id) {
-        const float weight = kRegionProfiles[region_id].population_share
-            * (activist_weighted ? kRegionProfiles[region_id].activist_density : 1.0f);
-        cumulative += weight / total_weight;
-        if (draw <= cumulative) {
-            return region_id;
-        }
-    }
-    return REGION_COUNT - 1u;
-}
+const char* DivisorMethodLabel(const unsigned int m) { return m == DHONDT ? "dhondt" : "sainte_lague"; }
 
 float AverageOrZero(const double sum, const unsigned int count) {
     return count > 0u ? static_cast<float>(sum / static_cast<double>(count)) : 0.0f;
 }
 
-std::array<float, kRegionPartySlots> ZeroRegionPartyContact() {
-    std::array<float, kRegionPartySlots> data{};
-    data.fill(0.0f);
-    return data;
-}
-
-template <typename ActivistRange>
-std::array<FamilyAggregate, kRegionPartySlots> SummarizeRegionalFamilies(
-    const ActivistRange& activists,
-    std::array<unsigned int, REGION_COUNT>& region_totals) {
-    region_totals.fill(0u);
-    std::array<FamilyAggregate, kRegionPartySlots> families{};
-
-    for (const auto& activist : activists) {
-        const unsigned int region_id = activist.template getVariable<unsigned int>("home_region");
-        const unsigned int family = activist.template getVariable<unsigned int>("preferred_family");
-        if (region_id >= REGION_COUNT || family >= PARTY_COUNT) {
-            continue;
-        }
-
-        ++region_totals[region_id];
-        FamilyAggregate& aggregate = families[FlattenRegionPartyIndex(region_id, family)];
-        ++aggregate.count;
-        aggregate.ideology_sum += activist.template getVariable<float>("ideology");
-        aggregate.organizer_skill_sum += activist.template getVariable<float>("organizer_skill");
-        aggregate.donor_access_sum += activist.template getVariable<float>("donor_access");
-        aggregate.launch_tendency_sum += activist.template getVariable<float>("launch_tendency");
-        aggregate.field_reach_sum += activist.template getVariable<float>("field_reach");
+unsigned int ChooseRegion(const float draw, const bool activist_weighted) {
+    float total = 0.0f;
+    for (const auto& r : kRegionProfiles)
+        total += r.population_share * (activist_weighted ? r.activist_density : 1.0f);
+    float cum = 0.0f;
+    for (unsigned int i = 0u; i < REGION_COUNT; ++i) {
+        cum += kRegionProfiles[i].population_share
+            * (activist_weighted ? kRegionProfiles[i].activist_density : 1.0f) / total;
+        if (draw <= cum) return i;
     }
-
-    return families;
+    return REGION_COUNT - 1u;
 }
 
-std::array<FamilyAggregate, PARTY_COUNT> CollapseStatewideFamilies(
-    const std::array<FamilyAggregate, kRegionPartySlots>& regional_families) {
-    std::array<FamilyAggregate, PARTY_COUNT> statewide{};
-    for (unsigned int region_id = 0u; region_id < REGION_COUNT; ++region_id) {
-        for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
-            const FamilyAggregate& regional = regional_families[FlattenRegionPartyIndex(region_id, party_id)];
-            FamilyAggregate& aggregate = statewide[party_id];
-            aggregate.count += regional.count;
-            aggregate.ideology_sum += regional.ideology_sum;
-            aggregate.organizer_skill_sum += regional.organizer_skill_sum;
-            aggregate.donor_access_sum += regional.donor_access_sum;
-            aggregate.launch_tendency_sum += regional.launch_tendency_sum;
-            aggregate.field_reach_sum += regional.field_reach_sum;
-        }
+FLAMEGPU_HOST_DEVICE_FUNCTION unsigned int FlatRegionParty(const unsigned int region, const unsigned int party) {
+    return region * MAX_PARTIES + party;
+}
+
+std::array<float, kRegionPartySlots> ZeroContacts() {
+    std::array<float, kRegionPartySlots> d{};
+    d.fill(0.0f);
+    return d;
+}
+
+// ===== PROCEDURAL NAMING & COLORS =====
+
+std::string GeneratePartyName(float econ, float social, float anti_est, float urban, bool is_legacy, unsigned int legacy_id) {
+    if (is_legacy) {
+        return legacy_id == 0u ? "Democratic" : "Republican";
     }
-    return statewide;
+    std::string name;
+    if (anti_est > 0.65f) name += "People's ";
+    else if (anti_est > 0.45f) name += "New ";
+
+    if (econ < -0.3f && social < -0.2f) name += "Progressive";
+    else if (econ < -0.2f && social > 0.2f) name += "Labor";
+    else if (econ > 0.25f && social > 0.3f) name += "Conservative";
+    else if (econ > 0.25f && social < -0.2f) name += "Liberty";
+    else if (fabsf(econ) < 0.2f && fabsf(social) < 0.2f) name += "Moderate";
+    else if (social > 0.4f) name += "Traditionalist";
+    else if (social < -0.4f) name += "Reform";
+    else name += "Independent";
+
+    if (urban > 0.7f) name += " Urban Coalition";
+    else if (urban < 0.3f) name += " Rural Alliance";
+    else name += " Party";
+    return name;
 }
 
-float ComputeRegionalBreadth(
-    const std::array<FamilyAggregate, kRegionPartySlots>& regional_families,
-    const std::array<unsigned int, REGION_COUNT>& region_totals,
-    const unsigned int party_id) {
-    unsigned int active_regions = 0u;
-    for (unsigned int region_id = 0u; region_id < REGION_COUNT; ++region_id) {
-        const unsigned int total = region_totals[region_id];
-        if (total == 0u) {
-            continue;
+std::string IdeologyToColor(float econ, float social, float anti_est, float est_age, bool is_legacy, unsigned int legacy_id) {
+    if (is_legacy) return legacy_id == 0u ? "#2563eb" : "#dc2626";
+    // Map ideology to HSL hue: left=240(blue), center=120(green), right=0/360(red)
+    float hue = 240.0f - (econ + 1.0f) * 120.0f; // [-1,1] -> [360, 0]
+    hue += social * 30.0f; // social axis shifts hue
+    if (hue < 0.0f) hue += 360.0f;
+    if (hue >= 360.0f) hue -= 360.0f;
+    float sat = 55.0f + 25.0f * anti_est;
+    float lit = 42.0f + 10.0f * est_age;
+    std::ostringstream ss;
+    ss << "hsl(" << static_cast<int>(hue) << "," << static_cast<int>(sat) << "%," << static_cast<int>(lit) << "%)";
+    return ss.str();
+}
+
+// ===== SEAT ALLOCATION =====
+
+double DivisorValue(const unsigned int seats, const unsigned int method) {
+    return method == DHONDT ? static_cast<double>(seats + 1u) : static_cast<double>(2u * seats + 1u);
+}
+
+std::unordered_map<unsigned int, unsigned int> AllocateDivisorSeats(
+    const std::vector<std::pair<unsigned int, std::uint64_t>>& qualified,
+    const unsigned int total_seats, const unsigned int method) {
+    std::unordered_map<unsigned int, unsigned int> sc;
+    sc.reserve(qualified.size());
+    for (const auto& [pid, _] : qualified) sc.emplace(pid, 0u);
+    for (unsigned int s = 0u; s < total_seats; ++s) {
+        unsigned int best = qualified.front().first;
+        double best_q = -1.0;
+        for (const auto& [pid, votes] : qualified) {
+            double q = static_cast<double>(votes) / DivisorValue(sc[pid], method);
+            if (q > best_q) { best_q = q; best = pid; }
         }
-        const FamilyAggregate& regional = regional_families[FlattenRegionPartyIndex(region_id, party_id)];
-        const float local_share = static_cast<float>(regional.count) / static_cast<float>(total);
-        if (regional.count >= 4u && local_share >= 0.05f) {
-            ++active_regions;
-        }
+        ++sc[best];
     }
-    return static_cast<float>(active_regions) / static_cast<float>(REGION_COUNT);
+    return sc;
 }
 
-template <typename PartyRange>
-std::array<PartyState, PARTY_COUNT> SnapshotParties(const PartyRange& parties) {
-    std::array<PartyState, PARTY_COUNT> party_states{};
+// ===== GENERIC CONTACT BUILDING =====
 
-    for (const auto& party : parties) {
-        const unsigned int party_id = party.template getVariable<unsigned int>("party_id");
-        if (party_id >= PARTY_COUNT) continue;
-        party_states[party_id] = PartyState{
-            party_id,
-            party.template getVariable<float>("ideology"),
-            party.template getVariable<float>("organization"),
-            party.template getVariable<float>("brand"),
-            party.template getVariable<float>("credibility"),
-            party.template getVariable<float>("projected_viability"),
-            party.template getVariable<float>("field_strength"),
-            party.template getVariable<float>("momentum"),
-            party.template getVariable<float>("fundraising"),
-            party.template getVariable<float>("media_reach"),
-            true,  // active
-        };
-    }
-
-    return party_states;
-}
-
-std::array<float, kRegionPartySlots> BuildRegionPartyContacts(
-    const std::array<FamilyAggregate, kRegionPartySlots>& regional_families,
-    const std::array<unsigned int, REGION_COUNT>& region_totals,
-    const std::array<PartyState, PARTY_COUNT>& party_states) {
-    std::array<float, kRegionPartySlots> contacts = ZeroRegionPartyContact();
-
-    for (unsigned int region_id = 0u; region_id < REGION_COUNT; ++region_id) {
-        const RegionProfile& region = kRegionProfiles[region_id];
-        const float total_activists = static_cast<float>(std::max(1u, region_totals[region_id]));
-
-        for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
-            const FamilyAggregate& aggregate = regional_families[FlattenRegionPartyIndex(region_id, party_id)];
-            const float family_share = static_cast<float>(aggregate.count) / total_activists;
-            const float avg_skill = AverageOrZero(aggregate.organizer_skill_sum, aggregate.count);
-            const float avg_donor = AverageOrZero(aggregate.donor_access_sum, aggregate.count);
-            const float avg_launch = AverageOrZero(aggregate.launch_tendency_sum, aggregate.count);
-            const float avg_reach = AverageOrZero(aggregate.field_reach_sum, aggregate.count);
-
-            float contact = 0.0f;
-            switch (party_id) {
-                case DEM:
-                    contact = ClampFloat(
-                        0.30f + 0.32f * region.urbanity + 0.18f * region.union_share - 0.16f * std::max(region.ideology_shift, 0.0f)
-                        + 2.0f * family_share + 0.10f * avg_skill,
-                        0.0f,
-                        1.0f);
-                    break;
-                case REP:
-                    contact = ClampFloat(
-                        0.30f + 0.24f * (1.0f - region.urbanity) + 0.18f * region.religiosity + 0.18f * std::max(region.ideology_shift, 0.0f)
-                        + 2.0f * family_share + 0.10f * avg_skill,
-                        0.0f,
-                        1.0f);
-                    break;
-                case GREEN:
-                    contact = ClampFloat(
-                        0.01f + 2.4f * family_share + 0.16f * region.green_affinity + 0.10f * avg_skill + 0.05f * avg_donor,
-                        0.0f,
-                        1.0f);
-                    break;
-                case LIBERTARIAN:
-                    contact = ClampFloat(
-                        0.01f + 2.1f * family_share + 0.14f * region.libertarian_affinity + 0.08f * avg_skill + 0.06f * avg_donor,
-                        0.0f,
-                        1.0f);
-                    break;
-                case CENTRIST:
-                    contact = ClampFloat(
-                        0.01f + 2.8f * family_share + 0.12f * region.college_share + 0.10f * (1.0f - fabsf(region.ideology_shift))
-                        + 0.07f * avg_launch,
-                        0.0f,
-                        1.0f);
-                    break;
-                case POPULIST:
-                    contact = ClampFloat(
-                        0.01f + 2.7f * family_share + 0.12f * region.populist_affinity + 0.10f * region.union_share
-                        + 0.08f * avg_reach,
-                        0.0f,
-                        1.0f);
-                    break;
-                default:
-                    break;
+std::array<float, kRegionPartySlots> BuildContacts(
+    const std::unordered_map<unsigned int, PartyState>& parties,
+    const std::array<unsigned int, REGION_COUNT>& region_activist_totals,
+    const std::unordered_map<unsigned int, IdeologyCluster>& party_clusters) {
+    auto contacts = ZeroContacts();
+    for (unsigned int rid = 0u; rid < REGION_COUNT; ++rid) {
+        const auto& rp = kRegionProfiles[rid];
+        const float total_act = static_cast<float>(std::max(1u, region_activist_totals[rid]));
+        for (const auto& [pid, state] : parties) {
+            if (!state.is_alive) continue;
+            // Generic contact formula using continuous party attributes
+            float act_share = 0.0f;
+            float avg_skill = 0.0f;
+            auto cit = party_clusters.find(pid);
+            if (cit != party_clusters.end()) {
+                const auto& cl = cit->second;
+                act_share = static_cast<float>(cl.region_counts[rid]) / total_act;
+                avg_skill = AverageOrZero(cl.organizer_skill_sum, cl.count);
             }
-
-            const PartyState& state = party_states[party_id];
-            if (state.active) {
-                const bool major_party = IsMajorParty(party_id);
-                contact = ClampFloat(
-                    contact * (major_party
-                        ? (0.64f + 0.24f * state.momentum + 0.20f * state.field_strength
-                            + 0.16f * state.projected_viability + 0.16f * state.fundraising + 0.14f * state.media_reach)
-                        : (0.56f + 0.16f * state.momentum + 0.14f * state.field_strength
-                            + 0.10f * state.projected_viability + 0.10f * state.fundraising + 0.08f * state.media_reach)),
-                    0.0f,
-                    1.0f);
+            // Urban/rural fit
+            float urban_fit = 1.0f - fabsf(rp.urbanity - state.urban_orientation);
+            // Base contact from activist presence + regional fit
+            float contact = ClampFloat(
+                0.02f + 2.0f * act_share + 0.14f * urban_fit + 0.10f * avg_skill
+                + 0.08f * state.organization + 0.06f * state.fundraising,
+                0.0f, 1.0f);
+            // Establishment bonus
+            if (state.establishment_age > 0.5f) {
+                contact = ClampFloat(contact + 0.20f * state.establishment_age + 0.12f * state.media_reach, 0.0f, 1.0f);
             }
-
-            contacts[FlattenRegionPartyIndex(region_id, party_id)] = contact;
+            // Campaign modifiers
+            contact = ClampFloat(
+                contact * (0.60f + 0.20f * state.momentum + 0.12f * state.field_strength + 0.08f * state.projected_viability),
+                0.0f, 1.0f);
+            contacts[FlatRegionParty(rid, pid)] = contact;
         }
     }
-
     return contacts;
 }
 
-float WeightedPartyContact(const std::array<float, kRegionPartySlots>& contacts, const unsigned int party_id) {
-    float weighted_average = 0.0f;
-    for (unsigned int region_id = 0u; region_id < REGION_COUNT; ++region_id) {
-        weighted_average += kRegionProfiles[region_id].population_share
-            * contacts[FlattenRegionPartyIndex(region_id, party_id)];
-    }
-    return ClampFloat(weighted_average, 0.0f, 1.0f);
+float WeightedContact(const std::array<float, kRegionPartySlots>& contacts, const unsigned int pid) {
+    float w = 0.0f;
+    for (unsigned int r = 0u; r < REGION_COUNT; ++r)
+        w += kRegionProfiles[r].population_share * contacts[FlatRegionParty(r, pid)];
+    return ClampFloat(w, 0.0f, 1.0f);
 }
 
-template <typename PartyRange>
-std::vector<PartyResult> BuildPartyResults(
-    flamegpu::HostAgentAPI& voters,
-    const PartyRange& parties,
-    const unsigned int total_valid,
-    const float threshold,
-    std::vector<std::pair<unsigned int, std::uint64_t>>* qualified_votes = nullptr) {
-    std::vector<PartyResult> results;
-    results.reserve(parties.size());
+// ===== CLUSTERING (grid-based density scan) =====
 
-    if (qualified_votes) {
-        qualified_votes->clear();
-        qualified_votes->reserve(parties.size());
+struct GridClusterResult {
+    float econ_centroid = 0.0f;
+    float social_centroid = 0.0f;
+    unsigned int total_activists = 0u;
+    IdeologyCluster cluster;
+};
+
+std::vector<GridClusterResult> ClusterActivists(
+    flamegpu::DeviceAgentVector activists,
+    const unsigned int min_size) {
+    // Grid cell counts in 2D ideology space [-1,1]x[-1,1]
+    unsigned int cell_count[CLUSTER_GRID][CLUSTER_GRID] = {};
+    double cell_econ[CLUSTER_GRID][CLUSTER_GRID] = {};
+    double cell_social[CLUSTER_GRID][CLUSTER_GRID] = {};
+    constexpr float gmin = -1.0f, gmax = 1.0f;
+    constexpr float cell_sz = (gmax - gmin) / static_cast<float>(CLUSTER_GRID);
+
+    for (const auto& a : activists) {
+        float e = a.getVariable<float>("econ_ideology");
+        float s = a.getVariable<float>("social_ideology");
+        unsigned int gx = std::min(CLUSTER_GRID - 1u, static_cast<unsigned int>((e - gmin) / cell_sz));
+        unsigned int gy = std::min(CLUSTER_GRID - 1u, static_cast<unsigned int>((s - gmin) / cell_sz));
+        cell_count[gx][gy]++;
+        cell_econ[gx][gy] += e;
+        cell_social[gx][gy] += s;
     }
 
-    for (const auto& party : parties) {
-        const unsigned int party_id = party.template getVariable<unsigned int>("party_id");
-        const std::uint64_t votes = static_cast<std::uint64_t>(voters.count<unsigned int>("vote_choice", party_id));
-        const float share = total_valid > 0u ? static_cast<float>(votes) / static_cast<float>(total_valid) : 0.0f;
-        results.push_back(PartyResult{party_id, votes, share, 0u});
-        if (qualified_votes && share >= threshold) {
-            qualified_votes->emplace_back(party_id, votes);
+    // Density threshold: requires dense cores to prevent merging distinct factions
+    unsigned int threshold = std::max(5u, min_size / 3u);
+
+    // DFS flood-fill to find connected components of dense cells
+    int labels[CLUSTER_GRID][CLUSTER_GRID];
+    for (auto& row : labels) for (auto& v : row) v = -1;
+    int next_label = 0;
+
+    for (unsigned int x = 0u; x < CLUSTER_GRID; ++x) {
+        for (unsigned int y = 0u; y < CLUSTER_GRID; ++y) {
+            if (cell_count[x][y] < threshold || labels[x][y] >= 0) continue;
+            // DFS
+            std::vector<std::pair<int,int>> stack;
+            stack.push_back({static_cast<int>(x), static_cast<int>(y)});
+            labels[x][y] = next_label;
+            while (!stack.empty()) {
+                auto [cx, cy] = stack.back(); stack.pop_back();
+                for (int dx = -1; dx <= 1; ++dx) {
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        int nx = cx + dx, ny = cy + dy;
+                        if (nx >= 0 && nx < static_cast<int>(CLUSTER_GRID) &&
+                            ny >= 0 && ny < static_cast<int>(CLUSTER_GRID) &&
+                            labels[nx][ny] < 0 && cell_count[nx][ny] >= threshold) {
+                            labels[nx][ny] = next_label;
+                            stack.push_back({nx, ny});
+                        }
+                    }
+                }
+            }
+            ++next_label;
         }
     }
 
-    std::sort(results.begin(), results.end(), [](const PartyResult& lhs, const PartyResult& rhs) {
-        if (lhs.votes != rhs.votes) {
-            return lhs.votes > rhs.votes;
+    if (next_label == 0) return {};
+
+    // Compute cluster centroids from grid
+    std::vector<GridClusterResult> results(next_label);
+    for (unsigned int x = 0u; x < CLUSTER_GRID; ++x) {
+        for (unsigned int y = 0u; y < CLUSTER_GRID; ++y) {
+            if (labels[x][y] < 0) continue;
+            auto& r = results[labels[x][y]];
+            r.total_activists += cell_count[x][y];
         }
-        return lhs.party_id < rhs.party_id;
-    });
-    return results;
-}
-
-void PrintCampaignCheckpoint(
-    const std::vector<PartyResult>& results,
-    const unsigned int step,
-    const unsigned int campaign_steps,
-    const unsigned int total_valid) {
-    std::printf("Campaign step %u/%u, valid votes=%u: ", step + 1u, campaign_steps, total_valid);
-    const unsigned int printed = std::min<unsigned int>(4u, static_cast<unsigned int>(results.size()));
-    for (unsigned int i = 0u; i < printed; ++i) {
-        const PartyResult& result = results[i];
-        std::printf("%s %.1f%%%s",
-            PartyLabel(result.party_id),
-            result.share * 100.0f,
-            i + 1u == printed ? "\n" : " | ");
     }
-}
 
-std::filesystem::path ResolveReportDirectory() {
-    const char* raw = std::getenv("WISCONSIN_PR_REPORT_DIR");
-    if (raw && *raw) {
-        return std::filesystem::path(raw);
+    // Now assign each activist to nearest cluster centroid and build full stats
+    // First compute rough centroids from grid
+    for (unsigned int x = 0u; x < CLUSTER_GRID; ++x) {
+        for (unsigned int y = 0u; y < CLUSTER_GRID; ++y) {
+            if (labels[x][y] < 0) continue;
+            auto& r = results[labels[x][y]];
+            r.econ_centroid += static_cast<float>(cell_econ[x][y]);
+            r.social_centroid += static_cast<float>(cell_social[x][y]);
+        }
     }
-    return std::filesystem::path("reports");
+    for (auto& r : results) {
+        if (r.total_activists > 0u) {
+            r.econ_centroid /= static_cast<float>(r.total_activists);
+            r.social_centroid /= static_cast<float>(r.total_activists);
+        }
+    }
+
+    // Assign activists to nearest centroid and accumulate full cluster stats
+    for (const auto& a : activists) {
+        float e = a.getVariable<float>("econ_ideology");
+        float s = a.getVariable<float>("social_ideology");
+        float best_dist = 1e9f;
+        int best_cl = -1;
+        for (int i = 0; i < next_label; ++i) {
+            float de = e - results[i].econ_centroid;
+            float ds = s - results[i].social_centroid;
+            float d = de * de + ds * ds;
+            if (d < best_dist) { best_dist = d; best_cl = i; }
+        }
+        if (best_cl < 0) continue;
+        auto& cl = results[best_cl].cluster;
+        cl.count++;
+        cl.econ_sum += e;
+        cl.social_sum += s;
+        cl.anti_est_sum += a.getVariable<float>("anti_est");
+        cl.organizer_skill_sum += a.getVariable<float>("organizer_skill");
+        cl.donor_access_sum += a.getVariable<float>("donor_access");
+        cl.launch_tendency_sum += a.getVariable<float>("launch_tendency");
+        cl.field_reach_sum += a.getVariable<float>("field_reach");
+        unsigned int hr = a.getVariable<unsigned int>("home_region");
+        if (hr < REGION_COUNT) cl.region_counts[hr]++;
+    }
+
+    // Update centroids from full assignment
+    for (auto& r : results) {
+        if (r.cluster.count > 0u) {
+            r.econ_centroid = static_cast<float>(r.cluster.econ_sum / r.cluster.count);
+            r.social_centroid = static_cast<float>(r.cluster.social_sum / r.cluster.count);
+        }
+    }
+
+    // Filter by minimum size and regional breadth
+    std::vector<GridClusterResult> filtered;
+    for (auto& r : results) {
+        if (r.cluster.count < min_size) continue;
+        unsigned int active_regions = 0u;
+        for (unsigned int i = 0u; i < REGION_COUNT; ++i)
+            if (r.cluster.region_counts[i] >= 2u) ++active_regions;
+        if (active_regions >= 2u) filtered.push_back(std::move(r));
+    }
+    return filtered;
 }
 
-std::vector<PartyResult> BuildParliamentOrdering(const std::vector<PartyResult>& results) {
+// ===== SVG PARLIAMENT CHART =====
+
+std::string BuildParliamentSvg(const std::vector<PartyResult>& results,
+                                const unsigned int total_seats) {
+    // Sort parties by economic ideology (left to right) for seat ordering
     std::vector<PartyResult> ordered = results;
-    std::sort(ordered.begin(), ordered.end(), [](const PartyResult& lhs, const PartyResult& rhs) {
-        const unsigned int lhs_order = PartySeatOrder(lhs.party_id);
-        const unsigned int rhs_order = PartySeatOrder(rhs.party_id);
-        if (lhs_order != rhs_order) {
-            return lhs_order < rhs_order;
+    std::sort(ordered.begin(), ordered.end(),
+        [](const PartyResult& a, const PartyResult& b) { return a.econ_ideology < b.econ_ideology; });
+
+    // Filter to parties with seats
+    std::vector<PartyResult> with_seats;
+    for (const auto& pr : ordered) {
+        if (pr.seats > 0u) with_seats.push_back(pr);
+    }
+    if (with_seats.empty()) {
+        return R"(<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 300"><text x="250" y="150" text-anchor="middle" fill="#64748b" font-family="Inter,sans-serif">No seats allocated</text></svg>)";
+    }
+
+    // Layout constants
+    const float svg_w = 500.0f;
+    const float svg_h = 310.0f;
+    const float cx_center = svg_w / 2.0f;
+    const float cy_base = 240.0f;    // Baseline of the hemicycle (bottom of arcs)
+    const float r_inner = 60.0f;
+    const float r_outer = 200.0f;
+    const float angle_pad = 0.08f;   // Padding at edges (radians)
+    const float angle_min = angle_pad;
+    const float angle_max = kPi - angle_pad;
+    const float dot_r = 3.5f;
+
+    // Determine number of rows
+    unsigned int num_rows;
+    if (total_seats > 200u) num_rows = 9u;
+    else if (total_seats > 120u) num_rows = 7u;
+    else if (total_seats > 60u) num_rows = 6u;
+    else if (total_seats > 30u) num_rows = 5u;
+    else num_rows = 4u;
+
+    // Compute radius and arc length for each row
+    std::vector<float> row_radii(num_rows);
+    float total_arc = 0.0f;
+    for (unsigned int row = 0u; row < num_rows; ++row) {
+        row_radii[row] = r_inner + (r_outer - r_inner) * static_cast<float>(row) / static_cast<float>(num_rows - 1u);
+        total_arc += row_radii[row];  // Arc length ∝ radius (angle span is same)
+    }
+
+    // Distribute total seats across rows proportional to arc length
+    unsigned int total_with_seats_count = 0u;
+    for (const auto& pr : with_seats) total_with_seats_count += pr.seats;
+
+    std::vector<unsigned int> row_seat_count(num_rows, 0u);
+    unsigned int allocated = 0u;
+    for (unsigned int row = 0u; row < num_rows; ++row) {
+        float frac = row_radii[row] / total_arc;
+        unsigned int n = static_cast<unsigned int>(std::round(frac * static_cast<float>(total_with_seats_count)));
+        row_seat_count[row] = n;
+        allocated += n;
+    }
+    // Fix rounding error
+    while (allocated < total_with_seats_count) { row_seat_count[num_rows - 1u]++; allocated++; }
+    while (allocated > total_with_seats_count) {
+        for (unsigned int row = 0u; row < num_rows && allocated > total_with_seats_count; ++row) {
+            if (row_seat_count[row] > 1u) { row_seat_count[row]--; allocated--; }
         }
-        return lhs.party_id < rhs.party_id;
-    });
-    return ordered;
-}
-
-std::string BuildParliamentSvg(
-    const std::vector<PartyResult>& results,
-    const SimulationArtifactConfig& config) {
-    const float width = 1100.0f;
-    const float height = 760.0f;
-    const float center_x = 390.0f;
-    const float center_y = 610.0f;
-    const float inner_radius = 120.0f;
-    const float ring_gap = 42.0f;
-    const float seat_radius = 9.0f;
-    const unsigned int rows = 5u;
-    const unsigned int majority = config.seats / 2u + 1u;
-
-    std::vector<float> radii(rows);
-    float total_weight = 0.0f;
-    for (unsigned int row = 0u; row < rows; ++row) {
-        radii[row] = inner_radius + ring_gap * static_cast<float>(row);
-        total_weight += radii[row];
-    }
-
-    std::vector<unsigned int> row_counts(rows, 1u);
-    unsigned int assigned_seats = 0u;
-    for (unsigned int row = 0u; row < rows; ++row) {
-        row_counts[row] = std::max(1u, static_cast<unsigned int>(std::lround(
-            static_cast<float>(config.seats) * radii[row] / total_weight)));
-        assigned_seats += row_counts[row];
-    }
-    while (assigned_seats > config.seats) {
-        const auto max_it = std::max_element(row_counts.begin(), row_counts.end());
-        if (*max_it <= 1u) {
-            break;
-        }
-        --(*max_it);
-        --assigned_seats;
-    }
-    while (assigned_seats < config.seats) {
-        const auto min_it = std::min_element(row_counts.begin(), row_counts.end());
-        ++(*min_it);
-        assigned_seats++;
-    }
-
-    std::vector<unsigned int> seat_parties;
-    seat_parties.reserve(config.seats);
-    for (const PartyResult& result : BuildParliamentOrdering(results)) {
-        for (unsigned int seat = 0u; seat < result.seats; ++seat) {
-            seat_parties.push_back(result.party_id);
-        }
-    }
-    while (seat_parties.size() < config.seats) {
-        seat_parties.push_back(kAbstain);
     }
 
     std::ostringstream svg;
-    svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width << "\" height=\"" << height
-        << "\" viewBox=\"0 0 " << width << " " << height << "\">\n";
-    svg << "<rect width=\"100%\" height=\"100%\" fill=\"#f8fafc\"/>\n";
-    svg << "<text x=\"56\" y=\"58\" font-size=\"30\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#0f172a\">Wisconsin PR Simulation</text>\n";
-    svg << "<text x=\"56\" y=\"92\" font-size=\"15\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#475569\">"
-        << "Parliament chart, turnout " << std::fixed << std::setprecision(1) << config.turnout_share * 100.0f
-        << "%, threshold " << config.threshold * 100.0f << "%, " << DivisorMethodLabel(config.divisor_method) << "</text>\n";
-    svg << "<text x=\"56\" y=\"126\" font-size=\"14\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#334155\">"
-        << "Majority: " << majority << " seats</text>\n";
+    svg << std::fixed << std::setprecision(3);
+    svg << R"(<?xml version="1.0" encoding="UTF-8"?>)" "\n"
+        << "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 "
+        << static_cast<int>(svg_w) << " " << static_cast<int>(svg_h) << "\">\n"
+        << "<rect width=\"" << static_cast<int>(svg_w) << "\" height=\""
+        << static_cast<int>(svg_h) << "\" fill=\"#f8fafc\" rx=\"12\"/>\n";
 
-    unsigned int seat_index = 0u;
-    for (unsigned int row = 0u; row < rows; ++row) {
-        const unsigned int seats_in_row = row_counts[row];
-        const float radius = radii[row];
-        for (unsigned int seat = 0u; seat < seats_in_row && seat_index < seat_parties.size(); ++seat, ++seat_index) {
-            const float angle = kPi
-                - kPi * (static_cast<float>(seat) + 0.5f) / static_cast<float>(seats_in_row);
-            const float x = center_x + radius * std::cos(angle);
-            const float y = center_y - radius * std::sin(angle);
-            svg << "<circle cx=\"" << x << "\" cy=\"" << y << "\" r=\"" << seat_radius
-                << "\" fill=\"" << PartyColor(seat_parties[seat_index]) << "\" stroke=\"#ffffff\" stroke-width=\"1.6\"/>\n";
+    // Render seats row by row. Within each row, each party gets seats
+    // proportional to its share of total, ensuring radial party boundaries.
+    for (unsigned int row = 0u; row < num_rows; ++row) {
+        unsigned int n = row_seat_count[row];
+        if (n == 0u) continue;
+        float r = row_radii[row];
+
+        // Distribute this row's seats among parties proportionally
+        struct RowParty { std::string color; std::string name; unsigned int count; };
+        std::vector<RowParty> row_parties;
+        unsigned int row_allocated = 0u;
+        for (const auto& pr : with_seats) {
+            float frac = static_cast<float>(pr.seats) / static_cast<float>(total_with_seats_count);
+            unsigned int pn = static_cast<unsigned int>(std::round(frac * static_cast<float>(n)));
+            row_parties.push_back({pr.color, pr.name, pn});
+            row_allocated += pn;
+        }
+        // Fix rounding for this row
+        while (row_allocated < n) {
+            // Add to the largest party
+            unsigned int best = 0u;
+            for (unsigned int pi = 1u; pi < row_parties.size(); ++pi)
+                if (with_seats[pi].seats > with_seats[best].seats) best = pi;
+            row_parties[best].count++;
+            row_allocated++;
+        }
+        while (row_allocated > n) {
+            for (unsigned int pi = 0u; pi < row_parties.size() && row_allocated > n; ++pi) {
+                if (row_parties[pi].count > 0u) { row_parties[pi].count--; row_allocated--; }
+            }
+        }
+
+        // Render each party's seats contiguously within this row
+        unsigned int seat_pos = 0u;
+        for (const auto& rp : row_parties) {
+            for (unsigned int s = 0u; s < rp.count; ++s) {
+                float angle;
+                if (n == 1u) {
+                    angle = (angle_min + angle_max) / 2.0f;
+                } else {
+                    angle = angle_min + (angle_max - angle_min) * static_cast<float>(seat_pos) / static_cast<float>(n - 1u);
+                }
+                float px = cx_center - r * cosf(angle);
+                float py = cy_base - r * sinf(angle);
+                svg << "<circle cx=\"" << px << "\" cy=\"" << py
+                    << "\" r=\"" << dot_r << "\" fill=\"" << rp.color
+                    << "\"><title>" << rp.name << "</title></circle>\n";
+                ++seat_pos;
+            }
         }
     }
 
-    svg << "<path d=\"M " << center_x - radii.back() - 12.0f << " " << center_y
-        << " A " << radii.back() + 12.0f << " " << radii.back() + 12.0f
-        << " 0 0 1 " << center_x + radii.back() + 12.0f << " " << center_y
-        << "\" fill=\"none\" stroke=\"#cbd5e1\" stroke-width=\"2\" stroke-dasharray=\"5 6\"/>\n";
+    // Title
+    svg << "<text x=\"" << cx_center << "\" y=\"24\" text-anchor=\"middle\" "
+        << "font-family=\"Inter,system-ui,sans-serif\" font-size=\"14\" font-weight=\"700\" fill=\"#1e293b\">"
+        << "Wisconsin Legislature (" << total_with_seats_count << " seats)</text>\n";
 
-    float legend_y = 170.0f;
-    for (const PartyResult& result : results) {
-        svg << "<rect x=\"650\" y=\"" << legend_y - 12.0f << "\" width=\"16\" height=\"16\" rx=\"3\" fill=\""
-            << PartyColor(result.party_id) << "\"/>\n";
-        svg << "<text x=\"676\" y=\"" << legend_y + 1.0f
-            << "\" font-size=\"15\" font-family=\"Segoe UI, Arial, sans-serif\" fill=\"#0f172a\">"
-            << PartyLabel(result.party_id) << "  " << std::fixed << std::setprecision(1) << result.share * 100.0f
-            << "%  " << result.seats << " seats</text>\n";
-        legend_y += 30.0f;
+    // Legend – centered below the hemicycle
+    float legend_y = cy_base + 16.0f;
+    // Measure total legend width first
+    float item_spacing = 16.0f;  // gap between items
+    float total_legend_w = 0.0f;
+    for (const auto& pr : with_seats) {
+        // swatch + gap + text at ~7px/char for font-size 10
+        float text_w = static_cast<float>(pr.name.size() + 5u) * 7.0f;
+        total_legend_w += 10.0f + 5.0f + text_w + item_spacing;
+    }
+    total_legend_w -= item_spacing; // no trailing gap
+    float legend_x = cx_center - total_legend_w / 2.0f;
+    for (const auto& pr : with_seats) {
+        svg << "<rect x=\"" << legend_x << "\" y=\"" << legend_y
+            << "\" width=\"10\" height=\"10\" rx=\"2\" fill=\"" << pr.color << "\"/>\n";
+        legend_x += 15.0f;
+        svg << "<text x=\"" << legend_x << "\" y=\"" << (legend_y + 9.0f)
+            << "\" font-family=\"Inter,system-ui,sans-serif\" font-size=\"10\" fill=\"#475569\">"
+            << pr.name << " (" << pr.seats << ")</text>\n";
+        float text_w = static_cast<float>(pr.name.size() + 5u) * 7.0f;
+        legend_x += text_w + item_spacing;
     }
 
     svg << "</svg>\n";
     return svg.str();
 }
 
-void WriteResultsArtifacts(
-    const std::vector<PartyResult>& results,
-    const SimulationArtifactConfig& config) {
-    const std::filesystem::path report_dir = ResolveReportDirectory();
-    std::filesystem::create_directories(report_dir);
+// ===== HTML REPORT =====
 
-    const std::filesystem::path svg_path = report_dir / "wisconsin_pr_results.svg";
-    const std::filesystem::path html_path = report_dir / "wisconsin_pr_results.html";
+std::string BuildHtmlReport(const std::vector<PartyResult>& results,
+                             const unsigned int total_seats,
+                             const std::uint64_t total_votes,
+                             const std::uint64_t total_voters,
+                             const unsigned int divisor,
+                             const float threshold,
+                             const std::string& svg_file) {
+    float turnout_pct = total_voters > 0u ? 100.0f * static_cast<float>(total_votes) / static_cast<float>(total_voters) : 0.0f;
 
-    const std::string svg = BuildParliamentSvg(results, config);
-    {
-        std::ofstream svg_file(svg_path, std::ios::out | std::ios::trunc);
-        svg_file << svg;
+    std::ostringstream h;
+    h << "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+      << "<title>Wisconsin PR Simulation Results</title>\n"
+      << "<style>body{font-family:Inter,sans-serif;background:#0f172a;color:#e2e8f0;max-width:900px;margin:0 auto;padding:2rem}"
+      << "h1{color:#38bdf8;text-align:center}table{width:100%;border-collapse:collapse;margin:1rem 0}"
+      << "th,td{padding:.5rem .75rem;text-align:left;border-bottom:1px solid #334155}"
+      << "th{color:#94a3b8}tr:hover{background:#1e293b}"
+      << ".swatch{display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:middle}"
+      << ".card{background:#1e293b;border-radius:10px;padding:1.5rem;margin:1rem 0}"
+      << ".stat{color:#94a3b8;font-size:.85rem}.val{color:#f8fafc;font-size:1.3rem;font-weight:700}"
+      << ".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}"
+      << "</style></head><body>\n"
+      << "<h1>Wisconsin PR Simulation</h1>\n";
+
+    h << "<div class=\"grid\">\n"
+      << "<div class=\"card\"><div class=\"stat\">Total Seats</div><div class=\"val\">" << total_seats << "</div></div>\n"
+      << "<div class=\"card\"><div class=\"stat\">Turnout</div><div class=\"val\">" << std::fixed << std::setprecision(1) << turnout_pct << "%</div></div>\n"
+      << "<div class=\"card\"><div class=\"stat\">Method</div><div class=\"val\">" << DivisorMethodLabel(divisor) << "</div></div>\n"
+      << "</div>\n";
+
+    h << "<div class=\"card\">\n<h2>Parliament</h2>\n"
+      << "<img src=\"" << svg_file << "\" alt=\"Parliament\" style=\"width:100%\">\n"
+      << "</div>\n";
+
+    h << "<div class=\"card\">\n<h2>Results</h2>\n"
+      << "<table><tr><th>Party</th><th>Votes</th><th>Share</th><th>Seats</th></tr>\n";
+    for (const auto& pr : results) {
+        h << "<tr><td><span class=\"swatch\" style=\"background:" << pr.color << "\"></span>"
+          << pr.name << "</td><td>" << pr.votes << "</td><td>"
+          << std::fixed << std::setprecision(1) << (pr.share * 100.0f) << "%</td><td>"
+          << pr.seats << "</td></tr>\n";
+    }
+    h << "</table></div>\n";
+
+    unsigned int majority_target = total_seats / 2 + 1;
+    std::string governance_text;
+    bool single_party_majority = false;
+    for (const auto& pr : results) {
+        if (pr.seats >= majority_target) {
+            governance_text = "<b>" + pr.name + "</b> has an absolute majority (" + std::to_string(pr.seats) + " seats) and can govern alone.";
+            single_party_majority = true;
+            break;
+        }
     }
 
-    std::ostringstream html;
-    html << "<!doctype html><html><head><meta charset=\"utf-8\"><title>Wisconsin PR Simulation</title>"
-         << "<style>body{font-family:Segoe UI,Arial,sans-serif;background:#f8fafc;color:#0f172a;margin:24px;}"
-         << ".wrap{display:grid;grid-template-columns:minmax(420px,1.2fr) minmax(300px,0.8fr);gap:24px;align-items:start;}"
-         << ".card{background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:18px 22px;box-shadow:0 12px 28px rgba(15,23,42,0.08);}"
-         << "h1{margin:0 0 8px;font-size:30px;}table{width:100%;border-collapse:collapse;}th,td{padding:10px 0;border-bottom:1px solid #e2e8f0;text-align:left;}"
-         << ".swatch{display:inline-block;width:12px;height:12px;border-radius:999px;margin-right:8px;vertical-align:middle;}"
-         << ".meta{display:grid;grid-template-columns:repeat(2,minmax(140px,1fr));gap:12px 18px;margin:16px 0 6px;}"
-         << ".meta div{background:#f8fafc;border-radius:14px;padding:10px 12px;}</style></head><body>";
-    html << "<div class=\"wrap\"><div class=\"card\"><h1>Wisconsin PR Simulation</h1><p>"
-         << "Campaign steps " << config.campaign_steps << ", threshold " << std::fixed << std::setprecision(1) << config.threshold * 100.0f
-         << "%, divisor " << DivisorMethodLabel(config.divisor_method) << ".</p>" << svg << "</div>";
-    html << "<div class=\"card\"><h2>Summary</h2><div class=\"meta\">"
-         << "<div><strong>Total voters</strong><br>" << config.total_voters << "</div>"
-         << "<div><strong>Valid votes</strong><br>" << config.total_valid << "</div>"
-         << "<div><strong>Abstentions</strong><br>" << config.abstentions << "</div>"
-         << "<div><strong>Turnout</strong><br>" << std::fixed << std::setprecision(2) << config.turnout_share * 100.0f << "%</div>"
-         << "</div><table><thead><tr><th>Party</th><th>Votes</th><th>Share</th><th>Seats</th></tr></thead><tbody>";
-    for (const PartyResult& result : results) {
-        html << "<tr><td><span class=\"swatch\" style=\"background:" << PartyColor(result.party_id) << "\"></span>"
-             << PartyLabel(result.party_id) << "</td><td>" << result.votes << "</td><td>"
-             << std::fixed << std::setprecision(2) << result.share * 100.0f << "%</td><td>" << result.seats << "</td></tr>";
-    }
-    html << "</tbody></table></div></div></body></html>";
-
-    {
-        std::ofstream html_file(html_path, std::ios::out | std::ios::trunc);
-        html_file << html.str();
+    if (!single_party_majority) {
+        std::vector<PartyResult> with_seats;
+        for (const auto& pr : results) if (pr.seats > 0) with_seats.push_back(pr);
+        
+        if (with_seats.size() >= 2) {
+            governance_text = "No single party holds a majority (" + std::to_string(majority_target) + " seats required). A coalition government is required.<br><br>";
+            governance_text += "<b>Simplest Potential Coalition (Largest Parties):</b><br><br>";
+            unsigned int seats_accum = with_seats[0].seats;
+            governance_text += "<span class=\"swatch\" style=\"background:" + with_seats[0].color + "\"></span>" + with_seats[0].name;
+            for (size_t i = 1; i < with_seats.size(); ++i) {
+                seats_accum += with_seats[i].seats;
+                governance_text += " + <span class=\"swatch\" style=\"background:" + with_seats[i].color + "\"></span>" + with_seats[i].name;
+                if (seats_accum >= majority_target) {
+                    governance_text += " <b>(" + std::to_string(seats_accum) + " seats total)</b>";
+                    break;
+                }
+            }
+        } else {
+            governance_text = "No party holds a majority.";
+        }
     }
 
-    const std::string svg_out = svg_path.string();
-    const std::string html_out = html_path.string();
-    std::printf("Report SVG: %s\n", svg_out.c_str());
-    std::printf("Report HTML: %s\n", html_out.c_str());
+    h << "<div class=\"card\">\n<h2>Governance & Coalition</h2>\n"
+      << "<p style=\"line-height:1.5\">" << governance_text << "</p>\n"
+      << "</div>\n";
+
+    h << "</body></html>\n";
+    return h.str();
 }
 
-FLAMEGPU_INIT_FUNCTION(SeedVoters) {
-    flamegpu::HostAgentAPI voters = FLAMEGPU->agent("voter");
-    const unsigned int voter_count = FLAMEGPU->environment.getProperty<unsigned int>("VOTER_COUNT");
-    const unsigned int random_seed = FLAMEGPU->environment.getProperty<unsigned int>("RANDOM_SEED");
+void WriteResultsArtifacts(const std::vector<PartyResult>& results,
+                            const unsigned int total_seats,
+                            const std::uint64_t total_votes,
+                            const std::uint64_t total_voters,
+                            const unsigned int divisor,
+                            const float threshold) {
+    std::filesystem::create_directories("reports");
+    std::string svg = BuildParliamentSvg(results, total_seats);
+    {
+        std::ofstream f("reports/wisconsin_pr_results.svg");
+        f << svg;
+    }
+    std::string html = BuildHtmlReport(results, total_seats, total_votes, total_voters,
+                                        divisor, threshold, "wisconsin_pr_results.svg");
+    {
+        std::ofstream f("reports/wisconsin_pr_results.html");
+        f << html;
+    }
+    std::printf("Reports written to reports/\n");
+}
 
-    std::mt19937 rng(random_seed);
-    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
-    std::normal_distribution<float> voter_noise(0.0f, 0.05f);
-    std::normal_distribution<float> urban_noise(0.0f, 0.08f);
-    std::normal_distribution<float> trait_noise(0.0f, 0.06f);
+// ===== INIT FUNCTIONS =====
+
+// Voter ideology cluster definitions (MLSP 2026 + ACS 2024 derived)
+struct VoterCluster {
+    float econ_mu, social_mu, conv_mu, share;
+    float econ_sigma, social_sigma;
+};
+
+constexpr std::array<VoterCluster, 6> kVoterClusters = {{
+    // econ_mu social_mu conv_mu share  econ_σ  social_σ
+    { -0.45f,  -0.50f,   0.55f,  0.18f, 0.20f,  0.22f },  // Urban progressive
+    { -0.30f,   0.15f,   0.45f,  0.16f, 0.25f,  0.20f },  // Labor/union
+    {  0.10f,  -0.05f,   0.30f,  0.22f, 0.28f,  0.28f },  // Suburban moderate
+    {  0.35f,   0.45f,   0.50f,  0.24f, 0.22f,  0.20f },  // Rural traditional
+    {  0.40f,  -0.30f,   0.65f,  0.10f, 0.18f,  0.18f },  // Liberty-oriented
+    { -0.05f,   0.20f,   0.25f,  0.10f, 0.30f,  0.30f },  // Disaffected/low-info
+}};
+
+FLAMEGPU_INIT_FUNCTION(SeedVoters) {
+    const unsigned int voter_count = FLAMEGPU->environment.getProperty<unsigned int>("VOTER_COUNT");
+    const unsigned int seed = FLAMEGPU->environment.getProperty<unsigned int>("RANDOM_SEED");
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    std::normal_distribution<float> norm(0.0f, 1.0f);
+
+    flamegpu::HostAgentAPI voters = FLAMEGPU->agent("voter");
 
     for (unsigned int i = 0u; i < voter_count; ++i) {
-        flamegpu::HostNewAgentAPI voter = voters.newAgent();
-        const unsigned int region_id = ChooseRegion(unit(rng), false);
-        const RegionProfile& region = kRegionProfiles[region_id];
+        flamegpu::HostNewAgentAPI v = voters.newAgent();
 
-        float ideology = 0.0f;
-        const float cluster_draw = unit(rng);
-        if (cluster_draw < 0.29f) {
-            ideology = -0.50f + 0.14f * voter_noise(rng) / 0.05f;
-        } else if (cluster_draw < 0.65f) {
-            ideology = 0.17f * voter_noise(rng) / 0.05f;
-        } else {
-            ideology = 0.47f + 0.13f * voter_noise(rng) / 0.05f;
+        // 1. Choose cluster
+        float draw = u01(rng);
+        unsigned int cl_idx = 0u;
+        float cum = 0.0f;
+        for (unsigned int c = 0u; c < kVoterClusters.size(); ++c) {
+            cum += kVoterClusters[c].share;
+            if (draw <= cum) { cl_idx = c; break; }
         }
-        ideology = ClampFloat(ideology + 0.82f * region.ideology_shift, -1.0f, 1.0f);
+        const auto& cl = kVoterClusters[cl_idx];
 
-        const float college_prob = ClampFloat(region.college_share + 0.08f * (1.0f - fabsf(ideology)), 0.02f, 0.95f);
-        const float union_prob = ClampFloat(region.union_share + 0.06f * (ideology < 0.0f ? 1.0f : 0.0f), 0.01f, 0.90f);
-        const unsigned int college = unit(rng) < college_prob ? 1u : 0u;
-        const unsigned int union_member = unit(rng) < union_prob ? 1u : 0u;
+        // 2. Choose region
+        unsigned int region_id = ChooseRegion(u01(rng), false);
+        const auto& rp = kRegionProfiles[region_id];
 
-        const float urbanity = ClampFloat(region.urbanity - 0.10f * ideology + urban_noise(rng), 0.0f, 1.0f);
-        const float religiosity = ClampFloat(region.religiosity + trait_noise(rng), 0.0f, 1.0f);
-        const float sophistication = ClampFloat(
-            0.16f + 0.38f * fabsf(ideology) + 0.12f * static_cast<float>(college) + 0.15f * region.college_share + 0.12f * unit(rng),
-            0.0f,
-            1.0f);
-        const float anti_est = ClampFloat(
-            0.12f + 0.32f * fabsf(ideology) + 0.12f * region.populist_affinity + 0.08f * (1.0f - region.urbanity) + 0.10f * unit(rng),
-            0.0f,
-            1.0f);
-        const float turnout = ClampFloat(
-            0.22f + 0.34f * fabsf(ideology) + region.turnout_bonus + 0.07f * static_cast<float>(college)
-            + 0.04f * static_cast<float>(union_member) + voter_noise(rng),
-            0.0f,
-            1.0f);
-        const float green_affinity = ClampFloat(
-            region.green_affinity + 0.14f * static_cast<float>(college) + 0.08f * urbanity
-            - 0.10f * religiosity - 0.08f * std::max(ideology, 0.0f) + trait_noise(rng),
-            0.0f,
-            1.0f);
-        const float libertarian_affinity = ClampFloat(
-            region.libertarian_affinity + 0.14f * std::max(ideology, 0.0f) + 0.10f * sophistication
-            - 0.08f * static_cast<float>(union_member) - 0.05f * urbanity + trait_noise(rng),
-            0.0f,
-            1.0f);
-        const float populist_affinity = ClampFloat(
-            region.populist_affinity + 0.18f * anti_est + 0.07f * static_cast<float>(union_member)
-            + 0.05f * (1.0f - static_cast<float>(college)) + trait_noise(rng),
-            0.0f,
-            1.0f);
-        const float dem_loyalty = ClampFloat(
-            0.12f + 0.32f * (ideology < 0.0f ? 1.0f : 0.0f) + 0.18f * static_cast<float>(union_member)
-            + 0.12f * urbanity + 0.08f * static_cast<float>(college) - 0.10f * anti_est + trait_noise(rng),
-            0.0f,
-            1.0f);
-        const float rep_loyalty = ClampFloat(
-            0.08f + 0.30f * (ideology > 0.0f ? 1.0f : 0.0f) + 0.16f * religiosity
-            + 0.09f * (1.0f - urbanity) - 0.13f * anti_est - 0.04f * static_cast<float>(college) + trait_noise(rng),
-            0.0f,
-            1.0f);
-        const float centrist_affinity = ClampFloat(
-            0.10f + 0.15f * sophistication + 0.10f * static_cast<float>(college)
-            + 0.15f * (1.0f - fabsf(ideology)) - 0.08f * anti_est + trait_noise(rng),
-            0.0f,
-            1.0f);
-        const float minor_openness = ClampFloat(
-            0.06f + 0.26f * anti_est + 0.08f * sophistication + 0.07f * (1.0f - 0.5f * (dem_loyalty + rep_loyalty))
-            - 0.07f * religiosity + 0.05f * unit(rng),
-            0.0f,
-            1.0f);
+        // 3. 2D ideology with cluster + regional shift + noise
+        float econ = ClampFloat(cl.econ_mu + rp.econ_shift * 0.3f + norm(rng) * cl.econ_sigma, -1.0f, 1.0f);
+        float social = ClampFloat(cl.social_mu + rp.social_shift * 0.3f + norm(rng) * cl.social_sigma, -1.0f, 1.0f);
 
-        voter.setVariable<float>("ideology", ideology);
-        voter.setVariable<float>("turnout", turnout);
-        voter.setVariable<float>("sophistication", sophistication);
-        voter.setVariable<float>("anti_est", anti_est);
-        voter.setVariable<float>("urbanity", urbanity);
-        voter.setVariable<unsigned int>("college", college);
-        voter.setVariable<unsigned int>("union_member", union_member);
-        voter.setVariable<float>("religiosity", religiosity);
-        voter.setVariable<float>("green_affinity", green_affinity);
-        voter.setVariable<float>("libertarian_affinity", libertarian_affinity);
-        voter.setVariable<float>("populist_affinity", populist_affinity);
-        voter.setVariable<float>("dem_loyalty", dem_loyalty);
-        voter.setVariable<float>("rep_loyalty", rep_loyalty);
-        voter.setVariable<float>("centrist_affinity", centrist_affinity);
-        voter.setVariable<float>("minor_openness", minor_openness);
-        voter.setVariable<unsigned int>("region_id", region_id);
-        voter.setVariable<unsigned int>("vote_choice", kAbstain);
+        // 4. Conviction: stronger at extremes, weaker at center
+        float dist = sqrtf(econ * econ + social * social);
+        float sophistication = ClampFloat(0.3f + 0.4f * rp.college_share + norm(rng) * 0.15f, 0.0f, 1.0f);
+        float conviction = ClampFloat(
+            0.15f + 0.45f * dist + 0.20f * sophistication + norm(rng) * 0.10f,
+            0.05f, 0.95f);
+
+        // 5. Other demographics from census data
+        float turnout_base = ClampFloat(0.55f + rp.turnout_bonus + 0.12f * sophistication + norm(rng) * 0.12f, 0.15f, 0.99f);
+        unsigned int college = (u01(rng) < rp.college_share) ? 1u : 0u;
+        unsigned int union_member = (u01(rng) < rp.union_share) ? 1u : 0u;
+        float religiosity = ClampFloat(rp.religiosity + norm(rng) * 0.18f, 0.0f, 1.0f);
+        float anti_est = ClampFloat(cl.conv_mu < 0.35f ? 0.35f + norm(rng) * 0.20f : 0.25f + norm(rng) * 0.18f, 0.0f, 1.0f);
+        float minor_openness = ClampFloat(0.15f + 0.30f * anti_est + norm(rng) * 0.12f, 0.0f, 1.0f);
+
+        // 6. Spatial position from region centroid + jitter
+        float jitter_scale = 3.0f * (1.0f + 0.5f * (1.0f - rp.urbanity));
+        float pos_x = ClampFloat(rp.center_x + norm(rng) * jitter_scale, kSpatialMin, kSpatialMax);
+        float pos_y = ClampFloat(rp.center_y + norm(rng) * jitter_scale, kSpatialMin, kSpatialMax);
+
+        v.setVariable<float>("econ_ideology", econ);
+        v.setVariable<float>("social_ideology", social);
+        v.setVariable<float>("conviction", conviction);
+        v.setVariable<float>("turnout", turnout_base);
+        v.setVariable<float>("sophistication", sophistication);
+        v.setVariable<float>("anti_est", anti_est);
+        v.setVariable<float>("urbanity", rp.urbanity);
+        v.setVariable<unsigned int>("college", college);
+        v.setVariable<unsigned int>("union_member", union_member);
+        v.setVariable<float>("religiosity", religiosity);
+        v.setVariable<float>("minor_openness", minor_openness);
+        v.setVariable<unsigned int>("region_id", region_id);
+        v.setVariable<unsigned int>("vote_choice", kAbstain);
+        v.setVariable<unsigned int>("previous_vote", kAbstain);
+        v.setVariable<float>("party_loyalty", 0.0f);
+        v.setVariable<unsigned int>("vote_streak", 0u);
+        v.setVariable<float>("perceived_local_support", 0.0f);
+        v.setVariable<float>("perceived_local_turnout", 0.5f);
+        v.setVariable<float>("pos_x", pos_x);
+        v.setVariable<float>("pos_y", pos_y);
     }
-
-    FLAMEGPU->environment.setProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", ZeroRegionPartyContact());
+    std::printf("Seeded %u voters across %u regions\n", voter_count, static_cast<unsigned int>(REGION_COUNT));
 }
 
 FLAMEGPU_INIT_FUNCTION(SeedActivists) {
+    const unsigned int count = FLAMEGPU->environment.getProperty<unsigned int>("ACTIVIST_COUNT");
+    const unsigned int seed = FLAMEGPU->environment.getProperty<unsigned int>("RANDOM_SEED");
+    std::mt19937 rng(seed + 7777u);
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    std::normal_distribution<float> norm(0.0f, 1.0f);
+
     flamegpu::HostAgentAPI activists = FLAMEGPU->agent("activist");
-    const unsigned int activist_count = FLAMEGPU->environment.getProperty<unsigned int>("ACTIVIST_COUNT");
-    const unsigned int random_seed = FLAMEGPU->environment.getProperty<unsigned int>("RANDOM_SEED");
 
-    std::mt19937 rng(random_seed + 17u);
-    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
-    std::normal_distribution<float> activist_noise(0.0f, 0.06f);
+    for (unsigned int i = 0u; i < count; ++i) {
+        flamegpu::HostNewAgentAPI a = activists.newAgent();
+        unsigned int region_id = ChooseRegion(u01(rng), true);
+        const auto& rp = kRegionProfiles[region_id];
 
-    for (unsigned int i = 0u; i < activist_count; ++i) {
-        flamegpu::HostNewAgentAPI activist = activists.newAgent();
-        const unsigned int region_id = ChooseRegion(unit(rng), true);
-        const RegionProfile& region = kRegionProfiles[region_id];
+        float econ = ClampFloat(rp.econ_shift * 1.5f + norm(rng) * 0.35f, -1.0f, 1.0f);
+        float social = ClampFloat(rp.social_shift * 1.5f + norm(rng) * 0.35f, -1.0f, 1.0f);
+        float anti_est = ClampFloat(0.35f + norm(rng) * 0.22f, 0.0f, 1.0f);
 
-        float ideology = 0.0f;
-        const float cluster_draw = unit(rng);
-        if (cluster_draw < 0.18f) {
-            ideology = -0.70f + 0.12f * activist_noise(rng) / 0.06f;
-        } else if (cluster_draw < 0.40f) {
-            ideology = -0.25f + 0.15f * activist_noise(rng) / 0.06f;
-        } else if (cluster_draw < 0.68f) {
-            ideology = 0.14f * activist_noise(rng) / 0.06f;
-        } else if (cluster_draw < 0.85f) {
-            ideology = 0.30f + 0.14f * activist_noise(rng) / 0.06f;
-        } else {
-            ideology = 0.68f + 0.12f * activist_noise(rng) / 0.06f;
-        }
-        ideology = ClampFloat(ideology + 0.55f * region.ideology_shift, -1.0f, 1.0f);
-
-        const float organizer_skill = ClampFloat(0.20f + 0.60f * unit(rng) + 0.12f * region.activist_density, 0.0f, 1.0f);
-        const float donor_access = ClampFloat(0.10f + 0.55f * unit(rng) + 0.10f * region.college_share, 0.0f, 1.0f);
-        const float anti_est = ClampFloat(
-            0.18f + 0.55f * fabsf(ideology) + 0.08f * region.populist_affinity + 0.10f * unit(rng),
-            0.0f,
-            1.0f);
-
-        unsigned int preferred_family = ChoosePartyFamily(ideology, anti_est);
-        const float family_tilt = unit(rng);
-        if (fabsf(ideology) < 0.15f && anti_est < 0.52f && donor_access > 0.34f && family_tilt < 0.55f) {
-            preferred_family = CENTRIST;
-        } else if (anti_est > 0.66f && region.populist_affinity > 0.20f && family_tilt < 0.42f) {
-            preferred_family = POPULIST;
-        } else if (ideology < -0.40f && region.green_affinity > 0.32f && family_tilt < 0.22f) {
-            preferred_family = GREEN;
-        } else if (ideology > 0.52f && region.libertarian_affinity > 0.16f && donor_access > 0.40f && family_tilt < 0.16f) {
-            preferred_family = LIBERTARIAN;
-        }
-
-        const float launch_tendency = ClampFloat(
-            0.08f + 0.45f * anti_est + 0.22f * organizer_skill + 0.17f * donor_access + 0.10f * region.activist_density,
-            0.0f,
-            1.0f);
-        const float field_reach = ClampFloat(
-            0.20f + 0.34f * organizer_skill + 0.18f * donor_access + 0.16f * launch_tendency + 0.12f * region.activist_density,
-            0.0f,
-            1.0f);
-
-        activist.setVariable<float>("ideology", ideology);
-        activist.setVariable<float>("organizer_skill", organizer_skill);
-        activist.setVariable<float>("donor_access", donor_access);
-        activist.setVariable<float>("anti_est", anti_est);
-        activist.setVariable<unsigned int>("preferred_family", preferred_family);
-        activist.setVariable<float>("launch_tendency", launch_tendency);
-        activist.setVariable<float>("field_reach", field_reach);
-        activist.setVariable<unsigned int>("home_region", region_id);
+        a.setVariable<float>("econ_ideology", econ);
+        a.setVariable<float>("social_ideology", social);
+        a.setVariable<float>("anti_est", anti_est);
+        a.setVariable<unsigned int>("home_region", region_id);
+        a.setVariable<float>("organizer_skill", ClampFloat(0.35f + norm(rng) * 0.20f, 0.05f, 1.0f));
+        a.setVariable<float>("donor_access", ClampFloat(0.2f + 0.25f * rp.college_share + norm(rng) * 0.15f, 0.0f, 1.0f));
+        a.setVariable<float>("launch_tendency", ClampFloat(0.3f + norm(rng) * 0.18f, 0.0f, 1.0f));
+        a.setVariable<float>("field_reach", ClampFloat(0.3f + norm(rng) * 0.20f, 0.05f, 1.0f));
+        a.setVariable<float>("effort", 0.5f);
+        a.setVariable<unsigned int>("affiliated_party", kAbstain);
     }
+    std::printf("Seeded %u activists\n", count);
 }
+
+FLAMEGPU_INIT_FUNCTION(SeedLegacyParties) {
+    flamegpu::HostAgentAPI parties = FLAMEGPU->agent("party");
+
+    // Democratic Party — legacy seed
+    {
+        auto p = parties.newAgent();
+        p.setVariable<unsigned int>("party_id", 0u);
+        p.setVariable<float>("econ_ideology", -0.28f);
+        p.setVariable<float>("social_ideology", -0.18f);
+        p.setVariable<float>("urban_orientation", 0.68f);
+        p.setVariable<float>("anti_est_posture", 0.15f);
+        p.setVariable<float>("religiosity_align", -0.20f);
+        p.setVariable<float>("union_alignment", 0.45f);
+        p.setVariable<float>("college_alignment", 0.35f);
+        p.setVariable<float>("establishment_age", 0.92f);
+        p.setVariable<float>("organization", 0.80f);
+        p.setVariable<float>("brand", 0.75f);
+        p.setVariable<float>("credibility", 0.70f);
+        p.setVariable<float>("projected_viability", 0.48f);
+        p.setVariable<float>("field_strength", 0.42f);
+        p.setVariable<float>("momentum", 0.50f);
+        p.setVariable<float>("fundraising", 0.70f);
+        p.setVariable<float>("media_reach", 0.75f);
+        p.setVariable<unsigned int>("is_alive", 1u);
+        p.setVariable<unsigned int>("is_legacy", 1u);
+        p.setVariable<unsigned int>("legacy_id", 0u);
+        p.setVariable<unsigned int>("consecutive_low_viability", 0u);
+    }
+    // Republican Party — legacy seed
+    {
+        auto p = parties.newAgent();
+        p.setVariable<unsigned int>("party_id", 1u);
+        p.setVariable<float>("econ_ideology", 0.32f);
+        p.setVariable<float>("social_ideology", 0.35f);
+        p.setVariable<float>("urban_orientation", 0.35f);
+        p.setVariable<float>("anti_est_posture", 0.18f);
+        p.setVariable<float>("religiosity_align", 0.40f);
+        p.setVariable<float>("union_alignment", -0.15f);
+        p.setVariable<float>("college_alignment", -0.10f);
+        p.setVariable<float>("establishment_age", 0.92f);
+        p.setVariable<float>("organization", 0.78f);
+        p.setVariable<float>("brand", 0.72f);
+        p.setVariable<float>("credibility", 0.65f);
+        p.setVariable<float>("projected_viability", 0.50f);
+        p.setVariable<float>("field_strength", 0.40f);
+        p.setVariable<float>("momentum", 0.52f);
+        p.setVariable<float>("fundraising", 0.68f);
+        p.setVariable<float>("media_reach", 0.72f);
+        p.setVariable<unsigned int>("is_alive", 1u);
+        p.setVariable<unsigned int>("is_legacy", 1u);
+        p.setVariable<unsigned int>("legacy_id", 1u);
+        p.setVariable<unsigned int>("consecutive_low_viability", 0u);
+    }
+    std::printf("Seeded 2 legacy parties (Democratic, Republican)\n");
+}
+
+FLAMEGPU_INIT_FUNCTION(DiscoverEmergentParties) {
+    flamegpu::DeviceAgentVector activists = FLAMEGPU->agent("activist").getPopulationData();
+    auto clusters = ClusterActivists(activists, MIN_CLUSTER_ACTIVISTS);
+
+    unsigned int next_id = 2u;  // 0=DEM, 1=REP
+    flamegpu::HostAgentAPI parties = FLAMEGPU->agent("party");
+    flamegpu::DeviceAgentVector existing_parties = parties.getPopulationData();
+
+    // Check each cluster against existing legacy parties
+    for (auto& cr : clusters) {
+        if (next_id >= MAX_PARTIES) break;
+        float ce = cr.econ_centroid;
+        float cs = cr.social_centroid;
+
+        // Skip if too close to a legacy party
+        bool too_close = false;
+        for (const auto& ep : existing_parties) {
+            float de = ce - ep.getVariable<float>("econ_ideology");
+            float ds = cs - ep.getVariable<float>("social_ideology");
+            if (sqrtf(de * de + ds * ds) < 0.20f) { too_close = true; break; }
+        }
+        if (too_close) continue;
+
+        // Birth emergent party from cluster
+        const auto& cl = cr.cluster;
+        float anti_est = AverageOrZero(cl.anti_est_sum, cl.count);
+        float avg_skill = AverageOrZero(cl.organizer_skill_sum, cl.count);
+        float avg_donor = AverageOrZero(cl.donor_access_sum, cl.count);
+        float avg_reach = AverageOrZero(cl.field_reach_sum, cl.count);
+
+        // Compute urban orientation from regional presence
+        float urban_sum = 0.0f, urban_wt = 0.0f;
+        for (unsigned int r = 0u; r < REGION_COUNT; ++r) {
+            float w = static_cast<float>(cl.region_counts[r]);
+            urban_sum += w * kRegionProfiles[r].urbanity;
+            urban_wt += w;
+        }
+        float urban_orient = urban_wt > 0.0f ? urban_sum / urban_wt : 0.5f;
+
+        // Religiosity/union/college alignment from regional correlation
+        float relig_sum = 0.0f, union_sum = 0.0f, college_sum = 0.0f;
+        for (unsigned int r = 0u; r < REGION_COUNT; ++r) {
+            float w = static_cast<float>(cl.region_counts[r]) / std::max(1.0f, static_cast<float>(cl.count));
+            relig_sum += w * (kRegionProfiles[r].religiosity - 0.45f) * 2.0f;
+            union_sum += w * (kRegionProfiles[r].union_share - 0.06f) * 8.0f;
+            college_sum += w * (kRegionProfiles[r].college_share - 0.32f) * 3.0f;
+        }
+
+        auto p = parties.newAgent();
+        p.setVariable<unsigned int>("party_id", next_id);
+        p.setVariable<float>("econ_ideology", ce);
+        p.setVariable<float>("social_ideology", cs);
+        p.setVariable<float>("urban_orientation", ClampFloat(urban_orient, 0.0f, 1.0f));
+        p.setVariable<float>("anti_est_posture", ClampFloat(anti_est, 0.0f, 1.0f));
+        p.setVariable<float>("religiosity_align", ClampFloat(relig_sum, -1.0f, 1.0f));
+        p.setVariable<float>("union_alignment", ClampFloat(union_sum, -1.0f, 1.0f));
+        p.setVariable<float>("college_alignment", ClampFloat(college_sum, -1.0f, 1.0f));
+        p.setVariable<float>("establishment_age", 0.0f);
+        p.setVariable<float>("organization", ClampFloat(avg_skill * 0.6f, 0.05f, 0.50f));
+        p.setVariable<float>("brand", ClampFloat(0.05f + avg_reach * 0.15f, 0.05f, 0.30f));
+        p.setVariable<float>("credibility", ClampFloat(0.10f + avg_skill * 0.25f, 0.05f, 0.40f));
+        p.setVariable<float>("projected_viability", ClampFloat(0.02f + static_cast<float>(cl.count) / 5000.0f, 0.02f, 0.15f));
+        p.setVariable<float>("field_strength", ClampFloat(avg_reach * 0.5f, 0.02f, 0.30f));
+        p.setVariable<float>("momentum", 0.10f);
+        p.setVariable<float>("fundraising", ClampFloat(avg_donor * 0.4f, 0.02f, 0.25f));
+        p.setVariable<float>("media_reach", ClampFloat(0.03f + avg_donor * 0.15f, 0.02f, 0.20f));
+        p.setVariable<unsigned int>("is_alive", 1u);
+        p.setVariable<unsigned int>("is_legacy", 0u);
+        p.setVariable<unsigned int>("legacy_id", next_id);
+        p.setVariable<unsigned int>("consecutive_low_viability", 0u);
+
+        std::string name = GeneratePartyName(ce, cs, anti_est, urban_orient, false, 0u);
+        std::printf("  Emerged: %s (econ=%.2f, social=%.2f, activists=%u)\n",
+                    name.c_str(), ce, cs, cl.count);
+        ++next_id;
+    }
+    std::printf("Total parties: %u\n", next_id);
+}
+
+// ===== AGENT FUNCTION CONDITIONS =====
+
+FLAMEGPU_AGENT_FUNCTION_CONDITION(PartyAliveCondition) {
+    return FLAMEGPU->getVariable<unsigned int>("is_alive") == 1u;
+}
+
+FLAMEGPU_AGENT_FUNCTION_CONDITION(CampaignPhaseCondition) {
+    return FLAMEGPU->environment.getProperty<unsigned int>("PHASE") >= 1u;
+}
+
+// ===== AGENT FUNCTIONS =====
 
 FLAMEGPU_AGENT_FUNCTION(PartyBroadcast, flamegpu::MessageNone, flamegpu::MessageBruteForce) {
     FLAMEGPU->message_out.setVariable<unsigned int>("party_id", FLAMEGPU->getVariable<unsigned int>("party_id"));
-    FLAMEGPU->message_out.setVariable<float>("ideology", FLAMEGPU->getVariable<float>("ideology"));
+    FLAMEGPU->message_out.setVariable<float>("econ_ideology", FLAMEGPU->getVariable<float>("econ_ideology"));
+    FLAMEGPU->message_out.setVariable<float>("social_ideology", FLAMEGPU->getVariable<float>("social_ideology"));
+    FLAMEGPU->message_out.setVariable<float>("urban_orientation", FLAMEGPU->getVariable<float>("urban_orientation"));
+    FLAMEGPU->message_out.setVariable<float>("anti_est_posture", FLAMEGPU->getVariable<float>("anti_est_posture"));
+    FLAMEGPU->message_out.setVariable<float>("religiosity_align", FLAMEGPU->getVariable<float>("religiosity_align"));
+    FLAMEGPU->message_out.setVariable<float>("union_alignment", FLAMEGPU->getVariable<float>("union_alignment"));
+    FLAMEGPU->message_out.setVariable<float>("college_alignment", FLAMEGPU->getVariable<float>("college_alignment"));
+    FLAMEGPU->message_out.setVariable<float>("establishment_age", FLAMEGPU->getVariable<float>("establishment_age"));
     FLAMEGPU->message_out.setVariable<float>("organization", FLAMEGPU->getVariable<float>("organization"));
     FLAMEGPU->message_out.setVariable<float>("brand", FLAMEGPU->getVariable<float>("brand"));
     FLAMEGPU->message_out.setVariable<float>("credibility", FLAMEGPU->getVariable<float>("credibility"));
     FLAMEGPU->message_out.setVariable<float>("projected_viability", FLAMEGPU->getVariable<float>("projected_viability"));
     FLAMEGPU->message_out.setVariable<float>("momentum", FLAMEGPU->getVariable<float>("momentum"));
-    FLAMEGPU->message_out.setVariable<float>("fundraising", FLAMEGPU->getVariable<float>("fundraising"));
     FLAMEGPU->message_out.setVariable<float>("media_reach", FLAMEGPU->getVariable<float>("media_reach"));
     return flamegpu::ALIVE;
 }
 
-FLAMEGPU_AGENT_FUNCTION(VoterChoose, flamegpu::MessageBruteForce, flamegpu::MessageNone) {
-    const float ideology = FLAMEGPU->getVariable<float>("ideology");
-    const float turnout = FLAMEGPU->getVariable<float>("turnout");
-    const float sophistication = FLAMEGPU->getVariable<float>("sophistication");
-    const float anti_est = FLAMEGPU->getVariable<float>("anti_est");
-    const float urbanity = FLAMEGPU->getVariable<float>("urbanity");
-    const float religiosity = FLAMEGPU->getVariable<float>("religiosity");
-    const float green_affinity = FLAMEGPU->getVariable<float>("green_affinity");
-    const float libertarian_affinity = FLAMEGPU->getVariable<float>("libertarian_affinity");
-    const float populist_affinity = FLAMEGPU->getVariable<float>("populist_affinity");
-    const float dem_loyalty = FLAMEGPU->getVariable<float>("dem_loyalty");
-    const float rep_loyalty = FLAMEGPU->getVariable<float>("rep_loyalty");
-    const float centrist_affinity = FLAMEGPU->getVariable<float>("centrist_affinity");
-    const float minor_openness = FLAMEGPU->getVariable<float>("minor_openness");
-    const float college = FLAMEGPU->getVariable<unsigned int>("college") ? 1.0f : 0.0f;
-    const float union_member = FLAMEGPU->getVariable<unsigned int>("union_member") ? 1.0f : 0.0f;
-    const unsigned int region_id = FLAMEGPU->getVariable<unsigned int>("region_id");
-    const float threshold = FLAMEGPU->environment.getProperty<float>("THRESHOLD");
-    const unsigned int campaign_steps = FLAMEGPU->environment.getProperty<unsigned int>("CAMPAIGN_STEPS");
-    const unsigned int current_step = FLAMEGPU->getStepCounter();
-    const float step_fraction = campaign_steps > 1u
-        ? static_cast<float>(current_step) / static_cast<float>(campaign_steps - 1u)
-        : 1.0f;
-
-    float best_score = -1.0e9f;
-    float best_contact = 0.0f;
-    unsigned int sampled_party = kAbstain;
-    float sampled_score = -1.0e9f;
-    float sampled_contact = 0.0f;
-    unsigned int candidate_count = 0u;
-    unsigned int candidate_ids[PARTY_COUNT]{};
-    float candidate_scores[PARTY_COUNT]{};
-    float candidate_contacts[PARTY_COUNT]{};
+FLAMEGPU_AGENT_FUNCTION(ActivistCanvass, flamegpu::MessageBruteForce, flamegpu::MessageNone) {
+    // Individual activist chooses party closest to own beliefs
+    const float my_econ = FLAMEGPU->getVariable<float>("econ_ideology");
+    const float my_social = FLAMEGPU->getVariable<float>("social_ideology");
+    float best_affinity = -1.0f;
+    unsigned int best_party = kAbstain;
 
     for (const auto& msg : FLAMEGPU->message_in) {
-        const unsigned int party_id = msg.getVariable<unsigned int>("party_id");
-        const float party_ideology = msg.getVariable<float>("ideology");
-        const float organization = msg.getVariable<float>("organization");
-        const float brand = msg.getVariable<float>("brand");
-        const float credibility = msg.getVariable<float>("credibility");
-        const float projected_viability = msg.getVariable<float>("projected_viability");
-        const float momentum = msg.getVariable<float>("momentum");
-        const float fundraising = msg.getVariable<float>("fundraising");
-        const float media_reach = msg.getVariable<float>("media_reach");
-        const float regional_contact = FLAMEGPU->environment.getProperty<float, kRegionPartySlots>(
-            "REGION_PARTY_CONTACT",
-            FlattenRegionPartyIndex(region_id, party_id));
-
-        const float closeness = 1.0f - fabsf(ideology - party_ideology);
-        float target_urbanity = 0.50f;
-        switch (party_id) {
-            case DEM:
-            case GREEN:
-                target_urbanity = 0.85f;
-                break;
-            case REP:
-            case LIBERTARIAN:
-                target_urbanity = 0.22f;
-                break;
-            case POPULIST:
-                target_urbanity = 0.32f;
-                break;
-            default:
-                break;
-        }
-
-        const float place_fit = 1.0f - fabsf(urbanity - target_urbanity);
-        float demographic_fit = 0.0f;
-        switch (party_id) {
-            case DEM:
-                demographic_fit = 0.20f * college + 0.18f * union_member + 0.10f * urbanity - 0.10f * religiosity;
-                break;
-            case REP:
-                demographic_fit = 0.17f * religiosity + 0.12f * (1.0f - urbanity) + 0.07f * (ideology > 0.0f ? 1.0f : 0.0f) - 0.05f * union_member;
-                break;
-            case GREEN:
-                demographic_fit = 0.28f * green_affinity + 0.12f * college + 0.06f * urbanity - 0.08f * religiosity;
-                break;
-            case LIBERTARIAN:
-                demographic_fit = 0.28f * libertarian_affinity + 0.10f * sophistication + 0.08f * (1.0f - union_member) - 0.03f * urbanity;
-                break;
-            case CENTRIST:
-                demographic_fit = 0.22f * centrist_affinity + 0.08f * college + 0.06f * sophistication + 0.04f * (1.0f - anti_est);
-                break;
-            case POPULIST:
-                demographic_fit = 0.24f * populist_affinity + 0.10f * anti_est + 0.08f * union_member + 0.04f * (1.0f - college);
-                break;
-            default:
-                break;
-        }
-
-        float habit_bonus = 0.0f;
-        switch (party_id) {
-            case DEM:
-                habit_bonus = 0.50f * dem_loyalty;
-                break;
-            case REP:
-                habit_bonus = 0.50f * rep_loyalty;
-                break;
-            case GREEN:
-                habit_bonus = 0.20f * green_affinity * minor_openness;
-                break;
-            case LIBERTARIAN:
-                habit_bonus = 0.20f * libertarian_affinity * minor_openness;
-                break;
-            case CENTRIST:
-                habit_bonus = 0.32f * centrist_affinity;
-                break;
-            case POPULIST:
-                habit_bonus = 0.22f * populist_affinity * minor_openness;
-                break;
-            default:
-                break;
-        }
-
-        const float duopoly_fatigue = ClampFloat(
-            0.18f + 0.55f * anti_est + 0.18f * minor_openness - 0.32f * 0.5f * (dem_loyalty + rep_loyalty),
-            0.0f,
-            1.0f);
-        float expressive_bonus = 0.0f;
-        switch (party_id) {
-            case GREEN:
-                expressive_bonus = 0.12f * green_affinity * minor_openness * (0.45f + 0.55f * duopoly_fatigue);
-                break;
-            case LIBERTARIAN:
-                expressive_bonus = 0.12f * libertarian_affinity * minor_openness * (0.45f + 0.55f * duopoly_fatigue);
-                break;
-            case CENTRIST:
-                expressive_bonus = 0.18f * centrist_affinity * (0.35f + 0.65f * duopoly_fatigue);
-                break;
-            case POPULIST:
-                expressive_bonus = 0.16f * populist_affinity * minor_openness * (0.40f + 0.60f * duopoly_fatigue);
-                break;
-            default:
-                break;
-        }
-
-        float viability_gap = threshold - projected_viability;
-        if (viability_gap < 0.0f) {
-            viability_gap = 0.0f;
-        }
-        const bool major_party = IsMajorParty(party_id);
-        const float strategic_penalty = viability_gap
-            * (0.16f + 0.54f * sophistication)
-            * (0.35f + 0.65f * step_fraction);
-        const float strategic_bonus = projected_viability >= threshold
-            ? (major_party ? (0.06f + 0.10f * sophistication) : (0.02f + 0.05f * sophistication))
-            : (-0.02f * sophistication * step_fraction);
-        const float outsider_signal = major_party
-            ? 0.0f
-            : 0.04f * anti_est * minor_openness * (0.72f - 0.30f * organization + 0.18f * step_fraction);
-        const float resource_signal = major_party
-            ? (0.22f * fundraising + 0.20f * media_reach + 0.10f * organization)
-            : (0.10f * fundraising + 0.09f * media_reach + 0.06f * organization);
-        const float coordination_readiness = 0.45f * projected_viability + 0.20f * fundraising
-            + 0.18f * media_reach + 0.17f * regional_contact;
-        const float minor_risk_penalty = major_party
-            ? 0.0f
-            : ClampFloat(
-                (0.14f + 0.30f * (1.0f - minor_openness) + 0.14f * sophistication + 0.08f * step_fraction)
-                * std::max(0.0f, 0.24f + 0.85f * viability_gap - coordination_readiness),
-                0.0f,
-                0.95f);
-
-        const float score =
-            1.68f * closeness
-            + 0.26f * organization
-            + 0.30f * brand
-            + 0.30f * credibility
-            + 0.42f * regional_contact
-            + 0.16f * momentum
-            + 0.18f * place_fit
-            + demographic_fit
-            + habit_bonus
-            + expressive_bonus
-            + resource_signal
-            + outsider_signal
-            + strategic_bonus
-            - strategic_penalty
-            - minor_risk_penalty;
-
-        if (score > best_score) {
-            best_score = score;
-            best_contact = regional_contact;
-        }
-        if (candidate_count < PARTY_COUNT) {
-            candidate_ids[candidate_count] = party_id;
-            candidate_scores[candidate_count] = score;
-            candidate_contacts[candidate_count] = regional_contact;
-            ++candidate_count;
+        const float de = my_econ - msg.getVariable<float>("econ_ideology");
+        const float ds = my_social - msg.getVariable<float>("social_ideology");
+        const float affinity = 1.0f - sqrtf(de * de + ds * ds);
+        if (affinity > best_affinity) {
+            best_affinity = affinity;
+            best_party = msg.getVariable<unsigned int>("party_id");
         }
     }
+    FLAMEGPU->setVariable<unsigned int>("affiliated_party", best_party);
 
-    if (candidate_count > 0u) {
-        const float decisiveness = ClampFloat(
-            1.55f + 1.05f * sophistication + 0.55f * 0.5f * (dem_loyalty + rep_loyalty) - 0.75f * minor_openness,
-            0.95f,
-            2.60f);
-        float total_weight = 0.0f;
-        float candidate_weights[PARTY_COUNT]{};
-        for (unsigned int i = 0u; i < candidate_count; ++i) {
-            const float weight = expf(decisiveness * (candidate_scores[i] - best_score));
-            candidate_weights[i] = weight;
-            total_weight += weight;
-        }
+    // Effort based on individual motivation
+    const float base_reach = FLAMEGPU->getVariable<float>("field_reach");
+    const float effort = base_reach * (0.6f + 0.4f * fmaxf(0.0f, best_affinity))
+        * (0.7f + 0.3f * FLAMEGPU->getVariable<float>("launch_tendency"));
+    FLAMEGPU->setVariable<float>("effort", ClampFloat(effort, 0.0f, 1.0f));
+    return flamegpu::ALIVE;
+}
 
-        float draw = FLAMEGPU->random.uniform<float>() * total_weight;
-        float cumulative_weight = 0.0f;
-        for (unsigned int i = 0u; i < candidate_count; ++i) {
-            cumulative_weight += candidate_weights[i];
-            if (draw <= cumulative_weight || i + 1u == candidate_count) {
-                sampled_party = candidate_ids[i];
-                sampled_score = candidate_scores[i];
-                sampled_contact = candidate_contacts[i];
-                break;
-            }
+FLAMEGPU_AGENT_FUNCTION(VoterPostSignal, flamegpu::MessageNone, flamegpu::MessageSpatial2D) {
+    FLAMEGPU->message_out.setLocation(
+        FLAMEGPU->getVariable<float>("pos_x"),
+        FLAMEGPU->getVariable<float>("pos_y"));
+    FLAMEGPU->message_out.setVariable<unsigned int>("previous_vote",
+        FLAMEGPU->getVariable<unsigned int>("vote_choice"));
+    FLAMEGPU->message_out.setVariable<float>("turnout_signal",
+        FLAMEGPU->getVariable<float>("turnout"));
+    return flamegpu::ALIVE;
+}
+
+FLAMEGPU_AGENT_FUNCTION(VoterObserveNeighbors, flamegpu::MessageSpatial2D, flamegpu::MessageNone) {
+    const float my_x = FLAMEGPU->getVariable<float>("pos_x");
+    const float my_y = FLAMEGPU->getVariable<float>("pos_y");
+    const unsigned int my_prev = FLAMEGPU->getVariable<unsigned int>("previous_vote");
+
+    unsigned int neighbor_count = 0u;
+    unsigned int same_choice_count = 0u;
+    float turnout_sum = 0.0f;
+
+    for (const auto& msg : FLAMEGPU->message_in(my_x, my_y)) {
+        ++neighbor_count;
+        if (msg.getVariable<unsigned int>("previous_vote") == my_prev && my_prev != kAbstain) {
+            ++same_choice_count;
         }
+        turnout_sum += msg.getVariable<float>("turnout_signal");
     }
 
-    float turnout_prob =
-        0.05f
-        + 0.52f * turnout
-        + 0.10f * sophistication
-        + 0.06f * college
-        + 0.06f * (sampled_party != kAbstain ? sampled_contact : best_contact)
-        + 0.05f * step_fraction
-        + 0.03f * ((sampled_party != kAbstain ? sampled_score : best_score) > 0.0f
-            ? (sampled_party != kAbstain ? sampled_score : best_score)
-            : 0.0f);
-    turnout_prob = ClampFloat(turnout_prob, 0.0f, 1.0f);
-
-    if (sampled_party != kAbstain && FLAMEGPU->random.uniform<float>() < turnout_prob) {
-        FLAMEGPU->setVariable<unsigned int>("vote_choice", sampled_party);
-    } else {
-        FLAMEGPU->setVariable<unsigned int>("vote_choice", kAbstain);
+    if (neighbor_count > 0u) {
+        FLAMEGPU->setVariable<float>("perceived_local_support",
+            static_cast<float>(same_choice_count) / static_cast<float>(neighbor_count));
+        FLAMEGPU->setVariable<float>("perceived_local_turnout",
+            turnout_sum / static_cast<float>(neighbor_count));
     }
     return flamegpu::ALIVE;
 }
 
-FLAMEGPU_INIT_FUNCTION(FormPartiesFromActivists) {
-    flamegpu::HostAgentAPI party_agents = FLAMEGPU->agent("party");
-    flamegpu::DeviceAgentVector activists = FLAMEGPU->agent("activist").getPopulationData();
-    std::array<unsigned int, REGION_COUNT> region_totals{};
-    const auto regional_families = SummarizeRegionalFamilies(activists, region_totals);
-    const unsigned int total_activists = static_cast<unsigned int>(activists.size());
-    const float total_activists_f = static_cast<float>(std::max(1u, total_activists));
-    const float minor_entry_share = ClampFloat(FLAMEGPU->environment.getProperty<float>("MINOR_ENTRY_SHARE"), 0.0f, 1.0f);
+FLAMEGPU_AGENT_FUNCTION(VoterChoose, flamegpu::MessageBruteForce, flamegpu::MessageNone) {
+    // --- Individual voter decision ---
+    const float voter_econ = FLAMEGPU->getVariable<float>("econ_ideology");
+    const float voter_social = FLAMEGPU->getVariable<float>("social_ideology");
+    const float conviction = FLAMEGPU->getVariable<float>("conviction");
+    const float turnout_prob = FLAMEGPU->getVariable<float>("turnout");
+    const float sophistication = FLAMEGPU->getVariable<float>("sophistication");
+    const float anti_est = FLAMEGPU->getVariable<float>("anti_est");
+    const float urbanity = FLAMEGPU->getVariable<float>("urbanity");
+    const float college_f = static_cast<float>(FLAMEGPU->getVariable<unsigned int>("college"));
+    const float union_f = static_cast<float>(FLAMEGPU->getVariable<unsigned int>("union_member"));
+    const float religiosity = FLAMEGPU->getVariable<float>("religiosity");
+    const float minor_openness = FLAMEGPU->getVariable<float>("minor_openness");
+    const unsigned int region_id = FLAMEGPU->getVariable<unsigned int>("region_id");
+    const unsigned int prev_vote = FLAMEGPU->getVariable<unsigned int>("vote_choice");
+    const float party_loyalty = FLAMEGPU->getVariable<float>("party_loyalty");
+    const unsigned int vote_streak = FLAMEGPU->getVariable<unsigned int>("vote_streak");
+    const float local_support = FLAMEGPU->getVariable<float>("perceived_local_support");
+    const float local_turnout = FLAMEGPU->getVariable<float>("perceived_local_turnout");
 
-    const auto statewide_families = CollapseStatewideFamilies(regional_families);
+    // Social influence on turnout
+    float adjusted_turnout = turnout_prob * (0.85f + 0.15f * local_turnout);
 
-    std::array<PartyState, PARTY_COUNT> party_states{};
-
-    const auto add_major_party = [&](const unsigned int party_id, const float anchor_ideology) {
-        const FamilyAggregate& aggregate = statewide_families[party_id];
-        const float share = static_cast<float>(aggregate.count) / total_activists_f;
-        const float avg_ideology = aggregate.count > 0u ? AverageOrZero(aggregate.ideology_sum, aggregate.count) : anchor_ideology;
-        const float avg_skill = AverageOrZero(aggregate.organizer_skill_sum, aggregate.count);
-        const float avg_donor = AverageOrZero(aggregate.donor_access_sum, aggregate.count);
-        const float avg_launch = AverageOrZero(aggregate.launch_tendency_sum, aggregate.count);
-        const float avg_reach = AverageOrZero(aggregate.field_reach_sum, aggregate.count);
-        const float regional_depth = ComputeRegionalBreadth(regional_families, region_totals, party_id);
-        const float fundraising = ClampFloat(0.58f + 0.30f * share + 0.18f * avg_donor + 0.08f * regional_depth, 0.45f, 1.0f);
-        const float media_reach = ClampFloat(0.48f + 0.26f * fundraising + 0.12f * avg_skill + 0.10f * avg_launch, 0.38f, 1.0f);
-
-        party_states[party_id] = PartyState{
-            party_id,
-            ClampFloat(0.70f * anchor_ideology + 0.30f * avg_ideology, -1.0f, 1.0f),
-            ClampFloat(0.72f + 0.95f * share + 0.10f * avg_skill, 0.60f, 1.0f),
-            ClampFloat(0.70f + 0.18f * avg_donor + 0.08f * share, 0.50f, 1.0f),
-            ClampFloat(0.72f + 0.10f * avg_launch + 0.08f * avg_skill, 0.55f, 1.0f),
-            ClampFloat(0.42f + 0.70f * share + 0.08f * regional_depth + 0.05f * avg_skill, 0.32f, 0.85f),
-            ClampFloat(0.58f + 0.80f * share + 0.10f * avg_reach + 0.10f * regional_depth, 0.42f, 1.0f),
-            ClampFloat(0.42f + 0.35f * share + 0.10f * avg_launch, 0.24f, 0.88f),
-            fundraising,
-            media_reach,
-            true,  // active
-        };
-    };
-
-    add_major_party(DEM, -0.35f);
-    add_major_party(REP, 0.35f);
-
-    for (unsigned int family : {GREEN, LIBERTARIAN, CENTRIST, POPULIST}) {
-        const FamilyAggregate& aggregate = statewide_families[family];
-        const float share = static_cast<float>(aggregate.count) / total_activists_f;
-        const float regional_depth = ComputeRegionalBreadth(regional_families, region_totals, family);
-        const float entry_score = 0.55f * share + 0.18f * AverageOrZero(aggregate.organizer_skill_sum, aggregate.count)
-            + 0.17f * AverageOrZero(aggregate.donor_access_sum, aggregate.count) + 0.10f * regional_depth;
-        if (aggregate.count < 10u || (share < minor_entry_share && entry_score < 0.18f)) {
-            continue;
-        }
-
-        const float avg_ideology = AverageOrZero(aggregate.ideology_sum, aggregate.count);
-        const float avg_skill = AverageOrZero(aggregate.organizer_skill_sum, aggregate.count);
-        const float avg_donor = AverageOrZero(aggregate.donor_access_sum, aggregate.count);
-        const float avg_launch = AverageOrZero(aggregate.launch_tendency_sum, aggregate.count);
-        const float avg_reach = AverageOrZero(aggregate.field_reach_sum, aggregate.count);
-
-        float ideology = avg_ideology;
-        switch (family) {
-            case GREEN:
-                ideology = ClampFloat(aggregate.count > 0u ? avg_ideology : -0.72f, -1.0f, -0.15f);
-                break;
-            case LIBERTARIAN:
-                ideology = ClampFloat(aggregate.count > 0u ? avg_ideology : 0.72f, 0.15f, 1.0f);
-                break;
-            case CENTRIST:
-                ideology = ClampFloat(0.35f * avg_ideology, -0.20f, 0.20f);
-                break;
-            case POPULIST:
-                ideology = ClampFloat(avg_ideology == 0.0f ? 0.05f : avg_ideology, -0.35f, 0.35f);
-                break;
-            default:
-                break;
-        }
-
-        const float base_organization = ClampFloat(0.06f + 2.40f * share + 0.16f * avg_skill + 0.12f * avg_donor + 0.10f * regional_depth, 0.0f, 0.90f);
-        const float fundraising = ClampFloat(0.03f + 1.25f * share + 0.24f * avg_donor + 0.10f * regional_depth, 0.0f, 0.72f);
-        const float media_reach = ClampFloat(0.02f + 0.42f * fundraising + 0.10f * avg_launch + 0.08f * regional_depth, 0.0f, 0.72f);
-        party_states[family] = PartyState{
-            family,
-            ideology,
-            base_organization,
-            ClampFloat(0.10f + 0.34f * base_organization + 0.10f * avg_donor + 0.08f * avg_launch, 0.0f, 0.80f),
-            ClampFloat(0.08f + 0.28f * base_organization + 0.12f * avg_launch + 0.10f * fundraising, 0.0f, 0.85f),
-            ClampFloat(0.02f + 0.80f * share + 0.08f * avg_skill + 0.08f * regional_depth + 0.10f * fundraising, 0.0f, 0.40f),
-            ClampFloat(0.04f + 2.00f * share + 0.14f * avg_reach + 0.12f * regional_depth, 0.0f, 0.70f),
-            ClampFloat(0.08f + 0.45f * share + 0.10f * avg_launch, 0.0f, 0.60f),
-            fundraising,
-            media_reach,
-            true,  // active
-        };
+    // Turnout threshold
+    const float threshold = FLAMEGPU->environment.getProperty<float>("THRESHOLD");
+    const float draw_turnout = FLAMEGPU->random.uniform<float>();
+    if (draw_turnout > adjusted_turnout) {
+        FLAMEGPU->setVariable<unsigned int>("previous_vote", prev_vote);
+        FLAMEGPU->setVariable<unsigned int>("vote_choice", kAbstain);
+        FLAMEGPU->setVariable<float>("party_loyalty", ClampFloat(party_loyalty * 0.9f, 0.0f, 1.0f));
+        return flamegpu::ALIVE;
     }
 
-    auto contacts = BuildRegionPartyContacts(regional_families, region_totals, party_states);
-    for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
-        PartyState& state = party_states[party_id];
-        if (state.active) {
-            state.field_strength = ClampFloat(0.62f * state.field_strength + 0.38f * WeightedPartyContact(contacts, party_id), 0.0f, 1.0f);
-            state.momentum = ClampFloat(0.72f * state.momentum + 0.28f * state.projected_viability, 0.0f, 1.0f);
-        }
-    }
-    contacts = BuildRegionPartyContacts(regional_families, region_totals, party_states);
-    FLAMEGPU->environment.setProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", contacts);
+    // Conviction-modulated weights
+    const float ideology_weight = 1.10f + 0.80f * conviction;
+    const float signal_weight = 0.40f - 0.20f * conviction;
 
-    for (unsigned int party_id = 0u; party_id < PARTY_COUNT; ++party_id) {
-        const PartyState& state = party_states[party_id];
-        if (!state.active) {
-            continue;
-        }
-        flamegpu::HostNewAgentAPI party = party_agents.newAgent();
-        party.setVariable<unsigned int>("party_id", state.party_id);
-        party.setVariable<float>("ideology", state.ideology);
-        party.setVariable<float>("organization", state.organization);
-        party.setVariable<float>("brand", state.brand);
-        party.setVariable<float>("credibility", state.credibility);
-        party.setVariable<float>("projected_viability", state.projected_viability);
-        party.setVariable<float>("field_strength", state.field_strength);
-        party.setVariable<float>("momentum", state.momentum);
-        party.setVariable<float>("fundraising", state.fundraising);
-        party.setVariable<float>("media_reach", state.media_reach);
+    // Evaluate every party via broadcast messages
+    unsigned int candidate_ids[MAX_PARTIES]{};
+    float candidate_scores[MAX_PARTIES]{};
+    unsigned int candidate_count = 0u;
+
+    for (const auto& msg : FLAMEGPU->message_in) {
+        if (candidate_count >= MAX_PARTIES) break;
+        const unsigned int pid = msg.getVariable<unsigned int>("party_id");
+        const float p_econ = msg.getVariable<float>("econ_ideology");
+        const float p_social = msg.getVariable<float>("social_ideology");
+        const float p_urban = msg.getVariable<float>("urban_orientation");
+        const float p_anti_est = msg.getVariable<float>("anti_est_posture");
+        const float p_relig = msg.getVariable<float>("religiosity_align");
+        const float p_union = msg.getVariable<float>("union_alignment");
+        const float p_college = msg.getVariable<float>("college_alignment");
+        const float p_est_age = msg.getVariable<float>("establishment_age");
+        const float org = msg.getVariable<float>("organization");
+        const float brand = msg.getVariable<float>("brand");
+        const float cred = msg.getVariable<float>("credibility");
+        const float viab = msg.getVariable<float>("projected_viability");
+        const float mom = msg.getVariable<float>("momentum");
+        const float media = msg.getVariable<float>("media_reach");
+
+        // 2D ideology distance
+        const float de = voter_econ - p_econ;
+        const float ds = voter_social - p_social;
+        const float closeness = fmaxf(0.0f, 1.0f - 0.7f * sqrtf(de * de + ds * ds));
+
+        // Place fit
+        const float place_fit = 1.0f - fabsf(urbanity - p_urban);
+
+        // Demographic alignment (dot product)
+        const float demographic_fit =
+            0.16f * p_college * college_f
+            + 0.14f * p_union * union_f
+            + 0.13f * p_relig * religiosity
+            + 0.11f * place_fit;
+
+        // Individual loyalty
+        const float streak_f = static_cast<float>(vote_streak > 10u ? 10u : vote_streak) / 10.0f;
+        const float loyalty_bonus = (prev_vote == pid && prev_vote != kAbstain)
+            ? party_loyalty * (0.30f + 0.15f * streak_f) : 0.0f;
+
+        // Anti-establishment resonance
+        const float outsider_bonus = 0.08f * anti_est * p_anti_est * minor_openness;
+
+        // Establishment trust/distrust
+        const float est_factor = anti_est > 0.5f
+            ? -0.06f * p_est_age
+            :  0.04f * p_est_age;
+
+        // Social conformity (individual perception)
+        const float conformity = (1.0f - anti_est) * (1.0f - conviction) * 0.08f;
+        const float social_bonus = (prev_vote == pid && prev_vote != kAbstain)
+            ? conformity * local_support : 0.0f;
+
+        // Regional contact from environment
+        const float regional_contact = FLAMEGPU->environment.getProperty<float, kRegionPartySlots>(
+            "REGION_PARTY_CONTACT", FlatRegionParty(region_id, pid));
+
+        // Strategic voting (minor party penalty)
+        const float strategic_penalty = (viab < threshold && sophistication > 0.5f)
+            ? 0.25f * sophistication * (1.0f - minor_openness) : 0.0f;
+
+        // Final score — conviction modulates which factors dominate
+        const float score =
+            ideology_weight * closeness
+            + signal_weight * org
+            + signal_weight * brand
+            + signal_weight * media
+            + 0.28f * cred
+            + 0.38f * regional_contact
+            + 0.14f * mom
+            + demographic_fit
+            + loyalty_bonus
+            + outsider_bonus
+            + est_factor
+            + social_bonus
+            - strategic_penalty;
+
+        candidate_ids[candidate_count] = pid;
+        candidate_scores[candidate_count] = score;
+        ++candidate_count;
     }
+
+    // Choose best party
+    unsigned int best_id = kAbstain;
+    float best_score = -1e9f;
+    for (unsigned int c = 0u; c < candidate_count; ++c) {
+        if (candidate_scores[c] > best_score) {
+            best_score = candidate_scores[c];
+            best_id = candidate_ids[c];
+        }
+    }
+
+    // Add slight randomness for tie-breaking
+    if (candidate_count >= 2u) {
+        float weights[MAX_PARTIES]{};
+        float max_w = -1e9f;
+        for (unsigned int c = 0u; c < candidate_count; ++c) {
+            weights[c] = candidate_scores[c];
+            if (weights[c] > max_w) max_w = weights[c];
+        }
+        float sum_w = 0.0f;
+        for (unsigned int c = 0u; c < candidate_count; ++c) {
+            weights[c] = expf(5.0f * (weights[c] - max_w));
+            sum_w += weights[c];
+        }
+        float roll = FLAMEGPU->random.uniform<float>() * sum_w;
+        float cum = 0.0f;
+        for (unsigned int c = 0u; c < candidate_count; ++c) {
+            cum += weights[c];
+            if (roll <= cum) { best_id = candidate_ids[c]; break; }
+        }
+    }
+
+    // Update memory
+    FLAMEGPU->setVariable<unsigned int>("previous_vote", prev_vote);
+    FLAMEGPU->setVariable<unsigned int>("vote_choice", best_id);
+    if (best_id == prev_vote && prev_vote != kAbstain) {
+        FLAMEGPU->setVariable<unsigned int>("vote_streak", vote_streak + 1u);
+        FLAMEGPU->setVariable<float>("party_loyalty", ClampFloat(party_loyalty + 0.05f, 0.0f, 1.0f));
+    } else {
+        FLAMEGPU->setVariable<unsigned int>("vote_streak", 0u);
+        FLAMEGPU->setVariable<float>("party_loyalty", ClampFloat(party_loyalty * 0.5f, 0.0f, 1.0f));
+    }
+    return flamegpu::ALIVE;
 }
+
+// ===== HOST STEP FUNCTIONS =====
 
 FLAMEGPU_STEP_FUNCTION(AdvanceCampaignAndAllocateSeats) {
-    flamegpu::HostAgentAPI voters = FLAMEGPU->agent("voter");
-    flamegpu::HostAgentAPI activist_agent = FLAMEGPU->agent("activist");
-    flamegpu::HostAgentAPI party_agent = FLAMEGPU->agent("party");
-
     const unsigned int step = FLAMEGPU->getStepCounter();
-    const unsigned int campaign_steps = FLAMEGPU->getSimulationConfig().steps;
-    const bool final_step = campaign_steps > 0u && step + 1u == campaign_steps;
-    const unsigned int total_voters = voters.count();
-    const unsigned int abstentions = voters.count<unsigned int>("vote_choice", kAbstain);
-    const unsigned int total_valid = total_voters > abstentions ? total_voters - abstentions : 0u;
-    const unsigned int seats = FLAMEGPU->environment.getProperty<unsigned int>("SEATS");
-    const float threshold = FLAMEGPU->environment.getProperty<float>("THRESHOLD");
-    const unsigned int divisor_method = FLAMEGPU->environment.getProperty<unsigned int>("DIVISOR_METHOD");
+    const unsigned int org_steps = FLAMEGPU->environment.getProperty<unsigned int>("ORGANIZING_STEPS");
+    const unsigned int total_steps = org_steps + FLAMEGPU->environment.getProperty<unsigned int>("CAMPAIGN_STEPS");
+    const bool is_organizing = step < org_steps;
+    const bool final_step = (step + 1u == total_steps);
 
-    flamegpu::DeviceAgentVector parties = party_agent.getPopulationData();
-    std::vector<std::pair<unsigned int, std::uint64_t>> qualified_votes;
-    auto results = BuildPartyResults(voters, parties, total_valid, threshold, final_step ? &qualified_votes : nullptr);
+    // Phase transition
+    if (step == org_steps) {
+        FLAMEGPU->environment.setProperty<unsigned int>("PHASE", 1u);
+        std::printf("\n=== CAMPAIGN PHASE BEGINS (step %u) ===\n\n", step);
+    }
 
-    if (!final_step) {
-        PrintCampaignCheckpoint(results, step, campaign_steps, total_valid);
+    // Aggregate activist data for contacts
+    flamegpu::DeviceAgentVector activists = FLAMEGPU->agent("activist").getPopulationData();
+    flamegpu::DeviceAgentVector party_pop = FLAMEGPU->agent("party").getPopulationData();
 
-        flamegpu::DeviceAgentVector activists = activist_agent.getPopulationData();
-        std::array<unsigned int, REGION_COUNT> region_totals{};
-        const auto regional_families = SummarizeRegionalFamilies(activists, region_totals);
-        const auto statewide_families = CollapseStatewideFamilies(regional_families);
-        const float total_activists_f = static_cast<float>(std::max(1u, static_cast<unsigned int>(activists.size())));
-        auto party_states = SnapshotParties(parties);
-        const auto existing_contacts = FLAMEGPU->environment.getProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT");
+    std::unordered_map<unsigned int, PartyState> party_states;
+    std::unordered_map<unsigned int, IdeologyCluster> party_clusters;
+    std::array<unsigned int, REGION_COUNT> region_act_totals{};
 
-        for (const PartyResult& result : results) {
-            if (result.party_id >= PARTY_COUNT) continue;
-            PartyState& state = party_states[result.party_id];
-            if (!state.active) {
-                continue;
-            }
-            const float contact = WeightedPartyContact(existing_contacts, state.party_id);
-            const bool major_party = IsMajorParty(state.party_id);
-            const FamilyAggregate& aggregate = statewide_families[state.party_id];
-            const float activist_share = static_cast<float>(aggregate.count) / total_activists_f;
-            const float avg_skill = AverageOrZero(aggregate.organizer_skill_sum, aggregate.count);
-            const float avg_donor = AverageOrZero(aggregate.donor_access_sum, aggregate.count);
-            const float avg_launch = AverageOrZero(aggregate.launch_tendency_sum, aggregate.count);
-            const float avg_reach = AverageOrZero(aggregate.field_reach_sum, aggregate.count);
-            const float regional_depth = ComputeRegionalBreadth(regional_families, region_totals, state.party_id);
-            const float funding_target = major_party
-                ? ClampFloat(0.60f + 0.18f * result.share + 0.18f * avg_donor + 0.10f * regional_depth + 0.08f * contact, 0.48f, 1.0f)
-                : ClampFloat(0.02f + 0.82f * activist_share + 0.14f * avg_donor + 0.10f * regional_depth + 0.04f * result.share, 0.0f, 0.55f);
-            const float media_target = major_party
-                ? ClampFloat(0.48f + 0.28f * funding_target + 0.10f * avg_skill + 0.10f * result.share + 0.08f * state.brand, 0.38f, 1.0f)
-                : ClampFloat(0.01f + 0.34f * funding_target + 0.08f * avg_launch + 0.06f * regional_depth + 0.04f * result.share, 0.0f, 0.52f);
-            const float viability_target = major_party
-                ? ClampFloat(0.38f + 0.60f * result.share + 0.10f * contact + 0.06f * media_target, 0.0f, 1.0f)
-                : ClampFloat(0.02f + 0.46f * result.share + 0.06f * contact + 0.08f * funding_target + 0.06f * media_target + 0.04f * regional_depth, 0.0f, 0.42f);
-            const float momentum_target = major_party
-                ? ClampFloat(0.38f + 1.70f * (result.share - threshold) + 0.18f * contact + 0.12f * media_target, 0.0f, 1.0f)
-                : ClampFloat(0.06f + 1.10f * (result.share - 0.55f * threshold) + 0.12f * contact + 0.08f * media_target, 0.0f, 0.55f);
+    for (const auto& p : party_pop) {
+        unsigned int pid = p.getVariable<unsigned int>("party_id");
+        PartyState ps;
+        ps.party_id = pid;
+        ps.econ_ideology = p.getVariable<float>("econ_ideology");
+        ps.social_ideology = p.getVariable<float>("social_ideology");
+        ps.urban_orientation = p.getVariable<float>("urban_orientation");
+        ps.anti_est_posture = p.getVariable<float>("anti_est_posture");
+        ps.organization = p.getVariable<float>("organization");
+        ps.brand = p.getVariable<float>("brand");
+        ps.credibility = p.getVariable<float>("credibility");
+        ps.projected_viability = p.getVariable<float>("projected_viability");
+        ps.field_strength = p.getVariable<float>("field_strength");
+        ps.momentum = p.getVariable<float>("momentum");
+        ps.fundraising = p.getVariable<float>("fundraising");
+        ps.media_reach = p.getVariable<float>("media_reach");
+        ps.establishment_age = p.getVariable<float>("establishment_age");
+        ps.is_alive = p.getVariable<unsigned int>("is_alive");
+        ps.is_legacy = p.getVariable<unsigned int>("is_legacy");
+        party_states[pid] = ps;
+        party_clusters[pid] = IdeologyCluster{};
+    }
 
-            state.fundraising = ClampFloat(0.60f * state.fundraising + 0.40f * funding_target, 0.0f, 1.0f);
-            state.media_reach = ClampFloat(0.58f * state.media_reach + 0.42f * media_target, 0.0f, 1.0f);
-            state.projected_viability = ClampFloat((major_party ? 0.55f : 0.70f) * state.projected_viability
-                + (major_party ? 0.45f : 0.30f) * viability_target, 0.0f, 1.0f);
-            state.momentum = ClampFloat(0.62f * state.momentum + 0.38f * momentum_target, 0.0f, 1.0f);
-            state.organization = ClampFloat(
-                0.68f * state.organization + 0.14f * state.fundraising + 0.08f * avg_skill + 0.06f * contact,
-                major_party ? 0.55f : 0.0f,
-                1.0f);
-            state.field_strength = ClampFloat(
-                0.58f * state.field_strength + 0.20f * contact + 0.14f * state.organization + 0.08f * avg_reach + 0.06f * regional_depth,
-                0.0f,
-                1.0f);
-            state.brand = ClampFloat(
-                0.70f * state.brand + 0.14f * state.media_reach + 0.08f * state.organization + 0.06f * result.share,
-                major_party ? 0.45f : 0.0f,
-                1.0f);
-            state.credibility = ClampFloat(
-                0.70f * state.credibility + (result.share >= threshold ? 0.12f : -0.03f) + 0.08f * state.organization + 0.05f * state.fundraising,
-                major_party ? 0.50f : 0.0f,
-                1.0f);
+    for (const auto& a : activists) {
+        unsigned int hr = a.getVariable<unsigned int>("home_region");
+        unsigned int ap = a.getVariable<unsigned int>("affiliated_party");
+        if (hr < REGION_COUNT) region_act_totals[hr]++;
+        if (party_clusters.count(ap)) {
+            auto& cl = party_clusters[ap];
+            cl.count++;
+            cl.region_counts[hr]++;
+            cl.organizer_skill_sum += a.getVariable<float>("organizer_skill");
+            cl.field_reach_sum += a.getVariable<float>("effort");
         }
+    }
 
-        const auto contacts = BuildRegionPartyContacts(regional_families, region_totals, party_states);
-        FLAMEGPU->environment.setProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", contacts);
+    auto contacts = BuildContacts(party_states, region_act_totals, party_clusters);
+    FLAMEGPU->environment.setProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", contacts);
 
-        for (auto party : parties) {
-            const unsigned int party_id = party.getVariable<unsigned int>("party_id");
-            if (party_id >= PARTY_COUNT) continue;
-            const PartyState& state = party_states[party_id];
-            if (!state.active) {
-                continue;
-            }
-            party.setVariable<float>("ideology", state.ideology);
-            party.setVariable<float>("organization", state.organization);
-            party.setVariable<float>("brand", state.brand);
-            party.setVariable<float>("credibility", state.credibility);
-            party.setVariable<float>("projected_viability", state.projected_viability);
-            party.setVariable<float>("field_strength", state.field_strength);
-            party.setVariable<float>("momentum", state.momentum);
-            party.setVariable<float>("fundraising", state.fundraising);
-            party.setVariable<float>("media_reach", state.media_reach);
-        }
-        parties.syncChanges();
+    if (is_organizing) {
+        std::printf("[Organizing step %u] Parties active: %zu\n", step, party_states.size());
         return;
     }
 
-    if (total_valid == 0u) {
-        std::printf("No valid votes were cast.\n");
-        return;
-    }
+    // Campaign phase: count votes and update party stats
+    flamegpu::DeviceAgentVector voters = FLAMEGPU->agent("voter").getPopulationData();
+    const unsigned int voter_count = static_cast<unsigned int>(voters.size());
 
-    if (qualified_votes.empty() && !results.empty()) {
-        qualified_votes.emplace_back(results.front().party_id, results.front().votes);
-    }
-    const auto seat_counts = AllocateDivisorSeats(qualified_votes, seats, divisor_method);
-    for (PartyResult& result : results) {
-        const auto seat_it = seat_counts.find(result.party_id);
-        if (seat_it != seat_counts.end()) {
-            result.seats = seat_it->second;
+    std::unordered_map<unsigned int, std::uint64_t> vote_counts;
+    std::uint64_t total_votes = 0u;
+    for (const auto& v : voters) {
+        unsigned int vc = v.getVariable<unsigned int>("vote_choice");
+        if (vc != kAbstain) {
+            vote_counts[vc]++;
+            ++total_votes;
         }
     }
 
-    const float turnout_share = total_voters > 0u ? static_cast<float>(total_valid) / static_cast<float>(total_voters) : 0.0f;
-
-    std::printf("\n=== Wisconsin PR simulation ===\n");
-    std::printf("Campaign steps: %u\n", campaign_steps);
-    std::printf("Total voters: %u\n", total_voters);
-    std::printf("Valid votes: %u\n", total_valid);
-    std::printf("Abstentions: %u\n", abstentions);
-    std::printf("Turnout: %.2f%%\n", turnout_share * 100.0f);
-    std::printf("Threshold: %.1f%%\n", threshold * 100.0f);
-    std::printf("Divisor method: %s\n", DivisorMethodLabel(divisor_method));
-    std::printf("Seats: %u\n\n", seats);
-
-    for (const PartyResult& result : results) {
-        const char* status = result.share >= threshold ? "qualified" : "below threshold";
-        std::printf("%-18s votes=%10llu share=%6.2f%% seats=%2u %s\n",
-            PartyLabel(result.party_id),
-            static_cast<unsigned long long>(result.votes),
-            result.share * 100.0f,
-            result.seats,
-            status);
+    // Update party viability
+    for (auto& [pid, ps] : party_states) {
+        if (!ps.is_alive) continue;
+        float share = total_votes > 0u ? static_cast<float>(vote_counts[pid]) / static_cast<float>(total_votes) : 0.0f;
+        float new_viab = ClampFloat(share * 2.0f, 0.0f, 1.0f);
+        // Find the party agent and update
+        for (unsigned int pi = 0u; pi < party_pop.size(); ++pi) {
+            auto p = party_pop[pi];
+            if (p.getVariable<unsigned int>("party_id") == pid) {
+                float old_viab = p.getVariable<float>("projected_viability");
+                p.setVariable<float>("projected_viability", 0.4f * old_viab + 0.6f * new_viab);
+                p.setVariable<float>("momentum", ClampFloat(new_viab - old_viab + 0.5f, 0.0f, 1.0f));
+                float wc = WeightedContact(contacts, pid);
+                p.setVariable<float>("field_strength", ClampFloat(wc, 0.0f, 1.0f));
+                break;
+            }
+        }
     }
-    const SimulationArtifactConfig config{
-        total_voters,
-        total_valid,
-        abstentions,
-        turnout_share,
-        threshold,
-        seats,
-        divisor_method,
-        campaign_steps
-    };
-    WriteResultsArtifacts(results, config);
+
+    float turnout_pct = static_cast<float>(total_votes) * 100.0f / std::max(1u, voter_count);
+    std::printf("[Campaign step %u] Turnout: %.1f%% | Votes cast: %" PRIu64 "\n",
+                step, turnout_pct, total_votes);
+    for (const auto& [pid, count] : vote_counts) {
+        float share = static_cast<float>(count) * 100.0f / std::max(static_cast<std::uint64_t>(1), total_votes);
+        std::printf("  Party %u: %" PRIu64 " votes (%.1f%%)\n", pid, count, share);
+    }
+
+    // Final step: allocate seats and write reports
+    if (final_step) {
+        const unsigned int total_seats = FLAMEGPU->environment.getProperty<unsigned int>("TOTAL_SEATS");
+        const float thresh = FLAMEGPU->environment.getProperty<float>("THRESHOLD");
+        const unsigned int div_method = FLAMEGPU->environment.getProperty<unsigned int>("DIVISOR_METHOD");
+
+        std::vector<std::pair<unsigned int, std::uint64_t>> qualified;
+        for (const auto& [pid, count] : vote_counts) {
+            float share = static_cast<float>(count) / std::max(static_cast<std::uint64_t>(1), total_votes);
+            if (share >= thresh) qualified.push_back({pid, count});
+        }
+
+        auto seat_map = AllocateDivisorSeats(qualified, total_seats, div_method);
+
+        std::printf("\n=== FINAL RESULTS ===\n");
+        std::vector<PartyResult> results;
+        for (const auto& [pid, count] : vote_counts) {
+            PartyResult pr;
+            pr.party_id = pid;
+            pr.votes = count;
+            pr.share = static_cast<float>(count) / std::max(static_cast<std::uint64_t>(1), total_votes);
+            pr.seats = seat_map.count(pid) ? seat_map[pid] : 0u;
+
+            // Find party attributes for naming
+            auto ps_it = party_states.find(pid);
+            if (ps_it != party_states.end()) {
+                const auto& ps = ps_it->second;
+                pr.name = GeneratePartyName(ps.econ_ideology, ps.social_ideology,
+                    ps.anti_est_posture, ps.urban_orientation,
+                    ps.is_legacy != 0u, ps.is_legacy != 0u ? (pid == 0u ? 0u : 1u) : 0u);
+                pr.color = IdeologyToColor(ps.econ_ideology, ps.social_ideology,
+                    ps.anti_est_posture, ps.establishment_age,
+                    ps.is_legacy != 0u, ps.is_legacy != 0u ? (pid == 0u ? 0u : 1u) : 0u);
+                pr.econ_ideology = ps.econ_ideology;
+            } else {
+                pr.name = "Unknown";
+                pr.color = "#666666";
+            }
+            results.push_back(pr);
+            std::printf("  %s: %" PRIu64 " votes (%.1f%%) → %u seats\n",
+                        pr.name.c_str(), pr.votes, pr.share * 100.0f, pr.seats);
+        }
+
+        WriteResultsArtifacts(results, total_seats, total_votes,
+                               static_cast<std::uint64_t>(voter_count), div_method, thresh);
+    }
 }
 
-void BuildModel(
-    flamegpu::ModelDescription& model,
-    const unsigned int voter_count,
-    const unsigned int activist_count,
-    const unsigned int seats,
-    const float threshold,
-    const unsigned int random_seed,
-    const float minor_entry_share,
-    const unsigned int divisor_method,
-    const unsigned int campaign_steps) {
-    flamegpu::EnvironmentDescription env = model.Environment();
-    env.newProperty<unsigned int>("VOTER_COUNT", voter_count);
-    env.newProperty<unsigned int>("ACTIVIST_COUNT", activist_count);
-    env.newProperty<unsigned int>("SEATS", seats);
-    env.newProperty<float>("THRESHOLD", threshold);
-    env.newProperty<unsigned int>("RANDOM_SEED", random_seed);
-    env.newProperty<float>("MINOR_ENTRY_SHARE", minor_entry_share);
-    env.newProperty<unsigned int>("DIVISOR_METHOD", divisor_method);
-    env.newProperty<unsigned int>("CAMPAIGN_STEPS", campaign_steps);
-    env.newProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", ZeroRegionPartyContact());
+FLAMEGPU_STEP_FUNCTION(PartyLifecycle) {
+    const unsigned int step = FLAMEGPU->getStepCounter();
+    const unsigned int org_steps = FLAMEGPU->environment.getProperty<unsigned int>("ORGANIZING_STEPS");
+    const unsigned int total_steps = org_steps + FLAMEGPU->environment.getProperty<unsigned int>("CAMPAIGN_STEPS");
+    if (step + 1u == total_steps) return;  // Don't kill parties on final step
 
+    flamegpu::DeviceAgentVector parties = FLAMEGPU->agent("party").getPopulationData();
+    for (unsigned int pi = 0u; pi < parties.size(); ++pi) {
+        auto p = parties[pi];
+        if (p.getVariable<unsigned int>("is_alive") == 0u) continue;
+        float viab = p.getVariable<float>("projected_viability");
+        unsigned int low_count = p.getVariable<unsigned int>("consecutive_low_viability");
+        if (viab < 0.01f) {
+            ++low_count;
+            p.setVariable<unsigned int>("consecutive_low_viability", low_count);
+            if (low_count >= 2u) {
+                p.setVariable<unsigned int>("is_alive", 0u);
+                std::printf("  Party %u died (viability collapsed)\n",
+                            p.getVariable<unsigned int>("party_id"));
+            }
+        } else {
+            p.setVariable<unsigned int>("consecutive_low_viability", 0u);
+        }
+    }
+}
+
+// ===== MODEL BUILDER =====
+
+void BuildModel(flamegpu::ModelDescription& model) {
+    auto env = model.Environment();
+
+    // Environment properties
+    env.newProperty<unsigned int>("VOTER_COUNT", ParseUnsignedEnv("WISCONSIN_PR_VOTERS", kDefaultVoterCount));
+    env.newProperty<unsigned int>("ACTIVIST_COUNT", ParseUnsignedEnv("WISCONSIN_PR_ACTIVISTS", kDefaultActivistCount));
+    
+    unsigned int total_seats = ParseUnsignedEnv("WISCONSIN_PR_SEATS", kDefaultSeats);
+    env.newProperty<unsigned int>("TOTAL_SEATS", total_seats);
+    
+    float natural_threshold = 1.0f / static_cast<float>(total_seats);
+    env.newProperty<float>("THRESHOLD", ParseFloatEnv("WISCONSIN_PR_THRESHOLD", natural_threshold));
+    env.newProperty<unsigned int>("RANDOM_SEED", ParseUnsignedEnv("WISCONSIN_PR_SEED", kDefaultRandomSeed));
+    env.newProperty<unsigned int>("DIVISOR_METHOD", ParseDivisorMethodEnv("WISCONSIN_PR_DIVISOR", SAINTE_LAGUE));
+    env.newProperty<unsigned int>("CAMPAIGN_STEPS", ParseUnsignedEnv("WISCONSIN_PR_CAMPAIGN_STEPS", kDefaultCampaignSteps));
+    env.newProperty<unsigned int>("ORGANIZING_STEPS", ParseUnsignedEnv("WISCONSIN_PR_ORGANIZING_STEPS", kDefaultOrganizingSteps));
+    env.newProperty<unsigned int>("PHASE", 0u);
+    env.newProperty<float, kRegionPartySlots>("REGION_PARTY_CONTACT", ZeroContacts());
+
+    // ---- Messages ----
     auto party_msg = model.newMessage<flamegpu::MessageBruteForce>("party_msg");
     party_msg.newVariable<unsigned int>("party_id");
-    party_msg.newVariable<float>("ideology");
+    party_msg.newVariable<float>("econ_ideology");
+    party_msg.newVariable<float>("social_ideology");
+    party_msg.newVariable<float>("urban_orientation");
+    party_msg.newVariable<float>("anti_est_posture");
+    party_msg.newVariable<float>("religiosity_align");
+    party_msg.newVariable<float>("union_alignment");
+    party_msg.newVariable<float>("college_alignment");
+    party_msg.newVariable<float>("establishment_age");
     party_msg.newVariable<float>("organization");
     party_msg.newVariable<float>("brand");
     party_msg.newVariable<float>("credibility");
     party_msg.newVariable<float>("projected_viability");
     party_msg.newVariable<float>("momentum");
-    party_msg.newVariable<float>("fundraising");
     party_msg.newVariable<float>("media_reach");
 
-    flamegpu::AgentDescription voter = model.newAgent("voter");
-    voter.newVariable<float>("ideology");
-    voter.newVariable<float>("turnout");
-    voter.newVariable<float>("sophistication");
-    voter.newVariable<float>("anti_est");
-    voter.newVariable<float>("urbanity");
-    voter.newVariable<unsigned int>("college");
-    voter.newVariable<unsigned int>("union_member");
-    voter.newVariable<float>("religiosity");
-    voter.newVariable<float>("green_affinity");
-    voter.newVariable<float>("libertarian_affinity");
-    voter.newVariable<float>("populist_affinity");
-    voter.newVariable<float>("dem_loyalty");
-    voter.newVariable<float>("rep_loyalty");
-    voter.newVariable<float>("centrist_affinity");
-    voter.newVariable<float>("minor_openness");
-    voter.newVariable<unsigned int>("region_id");
-    voter.newVariable<unsigned int>("vote_choice", kAbstain);
+    auto spatial_msg = model.newMessage<flamegpu::MessageSpatial2D>("spatial_voter_msg");
+    spatial_msg.setMin(kSpatialMin, kSpatialMin);
+    spatial_msg.setMax(kSpatialMax, kSpatialMax);
+    spatial_msg.setRadius(kSpatialRadius);
+    spatial_msg.newVariable<unsigned int>("previous_vote");
+    spatial_msg.newVariable<float>("turnout_signal");
 
-    flamegpu::AgentDescription activist = model.newAgent("activist");
-    activist.newVariable<float>("ideology");
-    activist.newVariable<float>("organizer_skill");
-    activist.newVariable<float>("donor_access");
-    activist.newVariable<float>("anti_est");
-    activist.newVariable<unsigned int>("preferred_family");
-    activist.newVariable<float>("launch_tendency");
-    activist.newVariable<float>("field_reach");
-    activist.newVariable<unsigned int>("home_region");
+    // ---- Party agent ----
+    auto party_agent = model.newAgent("party");
+    party_agent.newVariable<unsigned int>("party_id");
+    party_agent.newVariable<float>("econ_ideology");
+    party_agent.newVariable<float>("social_ideology");
+    party_agent.newVariable<float>("urban_orientation");
+    party_agent.newVariable<float>("anti_est_posture");
+    party_agent.newVariable<float>("religiosity_align");
+    party_agent.newVariable<float>("union_alignment");
+    party_agent.newVariable<float>("college_alignment");
+    party_agent.newVariable<float>("establishment_age");
+    party_agent.newVariable<float>("organization");
+    party_agent.newVariable<float>("brand");
+    party_agent.newVariable<float>("credibility");
+    party_agent.newVariable<float>("projected_viability");
+    party_agent.newVariable<float>("field_strength");
+    party_agent.newVariable<float>("momentum");
+    party_agent.newVariable<float>("fundraising");
+    party_agent.newVariable<float>("media_reach");
+    party_agent.newVariable<unsigned int>("is_alive");
+    party_agent.newVariable<unsigned int>("is_legacy");
+    party_agent.newVariable<unsigned int>("legacy_id");
+    party_agent.newVariable<unsigned int>("consecutive_low_viability");
+    auto fn_broadcast = party_agent.newFunction("PartyBroadcast", PartyBroadcast);
+    fn_broadcast.setMessageOutput("party_msg");
+    fn_broadcast.setFunctionCondition(PartyAliveCondition);
 
-    flamegpu::AgentDescription party = model.newAgent("party");
-    party.newVariable<unsigned int>("party_id");
-    party.newVariable<float>("ideology");
-    party.newVariable<float>("organization");
-    party.newVariable<float>("brand");
-    party.newVariable<float>("credibility");
-    party.newVariable<float>("projected_viability");
-    party.newVariable<float>("field_strength");
-    party.newVariable<float>("momentum");
-    party.newVariable<float>("fundraising");
-    party.newVariable<float>("media_reach");
+    // ---- Activist agent ----
+    auto activist_agent = model.newAgent("activist");
+    activist_agent.newVariable<float>("econ_ideology");
+    activist_agent.newVariable<float>("social_ideology");
+    activist_agent.newVariable<float>("anti_est");
+    activist_agent.newVariable<unsigned int>("home_region");
+    activist_agent.newVariable<float>("organizer_skill");
+    activist_agent.newVariable<float>("donor_access");
+    activist_agent.newVariable<float>("launch_tendency");
+    activist_agent.newVariable<float>("field_reach");
+    activist_agent.newVariable<float>("effort");
+    activist_agent.newVariable<unsigned int>("affiliated_party");
+    auto fn_canvass = activist_agent.newFunction("ActivistCanvass", ActivistCanvass);
+    fn_canvass.setMessageInput("party_msg");
 
-    auto party_fn = party.newFunction("party_broadcast", PartyBroadcast);
-    party_fn.setMessageOutput("party_msg");
-    auto voter_fn = voter.newFunction("voter_choose", VoterChoose);
-    voter_fn.setMessageInput("party_msg");
+    // ---- Voter agent ----
+    auto voter_agent = model.newAgent("voter");
+    voter_agent.newVariable<float>("econ_ideology");
+    voter_agent.newVariable<float>("social_ideology");
+    voter_agent.newVariable<float>("conviction");
+    voter_agent.newVariable<float>("turnout");
+    voter_agent.newVariable<float>("sophistication");
+    voter_agent.newVariable<float>("anti_est");
+    voter_agent.newVariable<float>("urbanity");
+    voter_agent.newVariable<unsigned int>("college");
+    voter_agent.newVariable<unsigned int>("union_member");
+    voter_agent.newVariable<float>("religiosity");
+    voter_agent.newVariable<float>("minor_openness");
+    voter_agent.newVariable<unsigned int>("region_id");
+    voter_agent.newVariable<unsigned int>("vote_choice");
+    voter_agent.newVariable<unsigned int>("previous_vote");
+    voter_agent.newVariable<float>("party_loyalty");
+    voter_agent.newVariable<unsigned int>("vote_streak");
+    voter_agent.newVariable<float>("perceived_local_support");
+    voter_agent.newVariable<float>("perceived_local_turnout");
+    voter_agent.newVariable<float>("pos_x");
+    voter_agent.newVariable<float>("pos_y");
 
-    model.newLayer("party_broadcast").addAgentFunction(party_fn);
-    model.newLayer("voter_choice").addAgentFunction(voter_fn);
+    auto fn_post = voter_agent.newFunction("VoterPostSignal", VoterPostSignal);
+    fn_post.setMessageOutput("spatial_voter_msg");
+    fn_post.setFunctionCondition(CampaignPhaseCondition);
 
+    auto fn_observe = voter_agent.newFunction("VoterObserveNeighbors", VoterObserveNeighbors);
+    fn_observe.setMessageInput("spatial_voter_msg");
+    fn_observe.setFunctionCondition(CampaignPhaseCondition);
+
+    auto fn_choose = voter_agent.newFunction("VoterChoose", VoterChoose);
+    fn_choose.setMessageInput("party_msg");
+    fn_choose.setFunctionCondition(CampaignPhaseCondition);
+
+    // ---- Layers ----
+    model.newLayer("L1_PartyBroadcast").addAgentFunction(fn_broadcast);
+    model.newLayer("L2_ActivistCanvass").addAgentFunction(fn_canvass);
+    model.newLayer("L3_VoterPostSignal").addAgentFunction(fn_post);
+    model.newLayer("L4_VoterObserveNeighbors").addAgentFunction(fn_observe);
+    model.newLayer("L5_VoterChoose").addAgentFunction(fn_choose);
+
+    // ---- Step functions ----
+    model.addStepFunction(AdvanceCampaignAndAllocateSeats);
+    model.addStepFunction(PartyLifecycle);
+
+    // ---- Init functions ----
     model.addInitFunction(SeedVoters);
     model.addInitFunction(SeedActivists);
-    model.addInitFunction(FormPartiesFromActivists);
-    model.addStepFunction(AdvanceCampaignAndAllocateSeats);
+    model.addInitFunction(SeedLegacyParties);
+    model.addInitFunction(DiscoverEmergentParties);
 }
 
-int RunMain(int argc, const char** argv) {
-    const unsigned int voter_count = ParseUnsignedEnv("WISCONSIN_PR_VOTERS", kDefaultVoterCount);
-    const unsigned int activist_count = ParseUnsignedEnv("WISCONSIN_PR_ACTIVISTS", kDefaultActivistCount);
-    const unsigned int seats = std::max(1u, ParseUnsignedEnv("WISCONSIN_PR_SEATS", kDefaultSeats));
-    const unsigned int random_seed = ParseUnsignedEnv("WISCONSIN_PR_RANDOM_SEED", kDefaultRandomSeed);
-    const float threshold = ClampFloat(ParseFloatEnv("WISCONSIN_PR_THRESHOLD", kDefaultThreshold), 0.0f, 1.0f);
-    const float minor_entry_share = ClampFloat(ParseFloatEnv("WISCONSIN_PR_MINOR_ENTRY_SHARE", kDefaultMinorEntryShare), 0.0f, 1.0f);
-    const unsigned int divisor_method = ParseDivisorMethodEnv("WISCONSIN_PR_DIVISOR_METHOD", SAINTE_LAGUE);
-    const unsigned int campaign_steps = std::max(1u, ParseUnsignedEnv("WISCONSIN_PR_STEPS", kDefaultCampaignSteps));
+// ===== ENTRY POINT =====
 
+void RunMain(int argc, const char** argv) {
     flamegpu::ModelDescription model(kModelName);
-    BuildModel(
-        model,
-        voter_count,
-        activist_count,
-        seats,
-        threshold,
-        random_seed,
-        minor_entry_share,
-        divisor_method,
-        campaign_steps);
-
-    std::printf(
-        "Launching %s with %u voters, %u activists, %u campaign steps, %u seats, %.1f%% threshold, %s, seed=%u\n",
-        kModelName,
-        voter_count,
-        activist_count,
-        campaign_steps,
-        seats,
-        threshold * 100.0f,
-        DivisorMethodLabel(divisor_method),
-        random_seed);
-
+    BuildModel(model);
     flamegpu::CUDASimulation simulation(model);
-    simulation.SimulationConfig().random_seed = random_seed;
-    simulation.SimulationConfig().steps = campaign_steps;
-    simulation.initialise(argc, argv);
+    simulation.SimulationConfig().steps =
+        ParseUnsignedEnv("WISCONSIN_PR_ORGANIZING_STEPS", kDefaultOrganizingSteps)
+        + ParseUnsignedEnv("WISCONSIN_PR_CAMPAIGN_STEPS", kDefaultCampaignSteps);
+    simulation.SimulationConfig().random_seed =
+        ParseUnsignedEnv("WISCONSIN_PR_SEED", kDefaultRandomSeed);
+    simulation.applyConfig();
     simulation.simulate();
-
-    flamegpu::util::cleanup();
-    return EXIT_SUCCESS;
 }
 
 }  // namespace wisconsin_pr
 
 int main(int argc, const char** argv) {
-    return wisconsin_pr::RunMain(argc, argv);
+    wisconsin_pr::RunMain(argc, argv);
+    return 0;
 }
+
