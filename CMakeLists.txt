@@ -19,6 +19,12 @@ flamegpu_init_cuda_architectures(PROJECT wisconsin_pr_simulation)
 # Name the project and set languages, this must be done after flamegpu_init_cuda_architectures
 project(wisconsin_pr_simulation CUDA CXX)
 
+# Enforce modern standard (C++20 — highest universally supported by CUDA 13.x)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
 # Include common rules from the FLAMEGPU/FLAMEGPU2 repositories CMake
 include(${FLAMEGPU_ROOT}/cmake/common.cmake)
 
