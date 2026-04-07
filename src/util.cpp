@@ -16,7 +16,7 @@ unsigned int ParseUnsignedEnv(const char* name, const unsigned int default_value
     char* end = nullptr;
     const unsigned long long parsed = std::strtoull(raw, &end, 10);
     if (end == raw || *end != '\0' || parsed > std::numeric_limits<unsigned int>::max()) {
-        std::printf("Ignoring invalid %s=%s, using %u\n", name, raw, default_value);
+        std::printf("Ignoring invalid %s=%s, using %u\n", name, SanitizeEnvForLog(raw).c_str(), default_value);
         return default_value;
     }
     return static_cast<unsigned int>(parsed);
@@ -30,7 +30,7 @@ float ParseFloatEnv(const char* name, const float default_value) {
     char* end = nullptr;
     const float parsed = std::strtof(raw, &end);
     if (end == raw || *end != '\0') {
-        std::printf("Ignoring invalid %s=%s, using %.3f\n", name, raw, default_value);
+        std::printf("Ignoring invalid %s=%s, using %.3f\n", name, SanitizeEnvForLog(raw).c_str(), default_value);
         return default_value;
     }
     return parsed;
@@ -51,9 +51,24 @@ unsigned int ParseDivisorMethodEnv(const char* name, const unsigned int default_
     if (method == "dhondt" || method == "d_hondt" || method == "d-hondt" || method == "d'hondt") {
         return DHONDT;
     }
-    std::printf("Ignoring invalid %s=%s, using %s\n", name, raw,
+    std::printf("Ignoring invalid %s=%s, using %s\n", name, SanitizeEnvForLog(raw).c_str(),
         default_value == DHONDT ? "dhondt" : "sainte_lague");
     return default_value;
+}
+
+std::string SanitizeEnvForLog(const char* raw) {
+    if (!raw) {
+        return "";
+    }
+    std::string sanitized;
+    for (const char* p = raw; *p; ++p) {
+        if (std::isprint(static_cast<unsigned char>(*p))) {
+            sanitized += *p;
+        } else {
+            sanitized += '?';
+        }
+    }
+    return sanitized;
 }
 
 }  // namespace wisconsin_pr

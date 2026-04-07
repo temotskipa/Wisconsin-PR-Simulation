@@ -13,6 +13,7 @@ enum DivisorMethod : unsigned int {
 unsigned int ParseUnsignedEnv(const char* name, const unsigned int default_value);
 float ParseFloatEnv(const char* name, const float default_value);
 unsigned int ParseDivisorMethodEnv(const char* name, const unsigned int default_value);
+std::string SanitizeEnvForLog(const char* raw);
 
 }  // namespace wisconsin_pr
 

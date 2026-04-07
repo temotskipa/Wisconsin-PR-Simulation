@@ -78,10 +78,23 @@ void test_parse_divisor_method_env() {
     std::printf("test_parse_divisor_method_env passed!\n");
 }
 
+void test_sanitize_env_for_log() {
+    std::printf("Running test_sanitize_env_for_log...\n");
+
+    assert(wisconsin_pr::SanitizeEnvForLog("safe").empty() == false);
+    assert(wisconsin_pr::SanitizeEnvForLog("safe") == "safe");
+    assert(wisconsin_pr::SanitizeEnvForLog("with\nnewline") == "with?newline");
+    assert(wisconsin_pr::SanitizeEnvForLog("with\resc") == "with?esc");
+    assert(wisconsin_pr::SanitizeEnvForLog(nullptr) == "");
+
+    std::printf("test_sanitize_env_for_log passed!\n");
+}
+
 int main() {
     test_parse_float_env();
     test_parse_unsigned_env();
     test_parse_divisor_method_env();
+    test_sanitize_env_for_log();
     std::printf("All tests passed!\n");
     return 0;
 }
